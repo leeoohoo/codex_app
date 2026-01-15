@@ -1,0 +1,7 @@
+{
+  "description": "基础模板：无依赖 module + backend.invoke 示例 + uiPrompts 示例",
+  "defaults": {
+    "appId": "app",
+    "withBackend": true
+  }
+}

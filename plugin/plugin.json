@@ -1,0 +1,38 @@
+{
+  "manifestVersion": 1,
+  "id": "com.leeoohoo.codex_app",
+  "name": "Codex App",
+  "version": "0.1.0",
+  "description": "Control Codex runs from ChatOS.",
+  "backend": {
+    "entry": "backend/index.mjs"
+  },
+  "apps": [
+    {
+      "id": "codex_app",
+      "name": "Codex 控制台",
+      "description": "Run Codex exec, view live events, manage threads.",
+      "entry": {
+        "type": "module",
+        "path": "apps/codex_app/index.mjs",
+        "compact": {
+          "type": "module",
+          "path": "apps/codex_app/compact.mjs"
+        }
+      },
+      "ai": {
+        "mcp": {
+          "entry": "apps/codex_app/mcp-server.mjs",
+          "description": "Run codex exec from ChatOS Agent via MCP (stdio).",
+          "allowMain": true,
+          "allowSub": true
+        },
+        "mcpPrompt": {
+          "title": "Codex 控制台 · MCP Prompt",
+          "zh": "apps/codex_app/mcp-prompt.zh.md",
+          "en": "apps/codex_app/mcp-prompt.en.md"
+        }
+      }
+    }
+  ]
+}
