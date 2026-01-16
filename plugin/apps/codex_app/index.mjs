@@ -375,6 +375,7 @@ export function mount({ container, host, slots }) {
   const INPUT_PAGE_SIZE = 6;
 
   const RUN_SETTINGS_STORAGE_KEY = 'codex_app.run_settings.v1';
+  const RUN_SETTINGS_BY_WINDOW_STORAGE_KEY = 'codex_app.run_settings.by_window.v1';
 
   const loadRunSettings = () => {
     try {
@@ -394,6 +395,64 @@ export function mount({ container, host, slots }) {
       localStorage.setItem(RUN_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
     } catch {
       // ignore
+    }
+  };
+
+  const loadRunSettingsByWindow = () => {
+    try {
+      if (typeof localStorage === 'undefined') return {};
+      const raw = localStorage.getItem(RUN_SETTINGS_BY_WINDOW_STORAGE_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  };
+
+  const saveRunSettingsByWindow = (settingsMap) => {
+    try {
+      if (typeof localStorage === 'undefined') return;
+      localStorage.setItem(RUN_SETTINGS_BY_WINDOW_STORAGE_KEY, JSON.stringify(settingsMap));
+    } catch {
+      // ignore
+    }
+  };
+
+  const loadWindowRunSettings = (windowId) => {
+    const id = String(windowId || '');
+    if (!id) return null;
+    const map = loadRunSettingsByWindow();
+    const entry = map[id];
+    return entry && typeof entry === 'object' ? entry : null;
+  };
+
+  const saveWindowRunSettings = (windowId, settings) => {
+    const id = String(windowId || '');
+    if (!id) return;
+    const map = loadRunSettingsByWindow();
+    map[id] = settings;
+    saveRunSettingsByWindow(map);
+  };
+
+  const ensureWindowRunSettings = (windowId, seedSettings) => {
+    const id = String(windowId || '');
+    if (!id) return null;
+    const existing = loadWindowRunSettings(id);
+    if (existing) return existing;
+    const base = seedSettings && typeof seedSettings === 'object' ? seedSettings : getDefaultRunSettings();
+    const snapshot = { ...base };
+    saveWindowRunSettings(id, snapshot);
+    return snapshot;
+  };
+
+  const deleteWindowRunSettings = (windowId) => {
+    const id = String(windowId || '');
+    if (!id) return;
+    const map = loadRunSettingsByWindow();
+    if (map && Object.prototype.hasOwnProperty.call(map, id)) {
+      delete map[id];
+      saveRunSettingsByWindow(map);
     }
   };
 
@@ -890,6 +949,8 @@ export function mount({ container, host, slots }) {
     state.selectedWindowId = String(windowId || '');
     renderWindowList();
     updateSelectedHeader();
+    const settings = ensureWindowRunSettings(state.selectedWindowId);
+    applyRunSettingsToControls(settings);
     renderInputHistory();
     renderSideTasks();
     loadWindowLogs(state.selectedWindowId).catch((e) =>
@@ -990,6 +1051,7 @@ export function mount({ container, host, slots }) {
           state.windowTodos.delete(win.id);
           state.windowInputs.delete(win.id);
           state.inputPages.delete(win.id);
+          deleteWindowRunSettings(win.id);
           if (state.selectedWindowId === win.id) {
             setSelectedWindow(state.windows[0]?.id || '');
           } else {
@@ -1361,35 +1423,6 @@ export function mount({ container, host, slots }) {
   const { wrap: skipRepoWrap, input: skipRepoInput } = mkCheckbox('跳过 git repo 检查（--skip-git-repo-check）');
   styleCheckboxCard(skipRepoWrap);
 
-  const persisted = loadRunSettings() || {};
-  let hadPersistedModel = false;
-  if (typeof persisted.codexCommand === 'string' && persisted.codexCommand.trim()) {
-    codexCommandInput.value = persisted.codexCommand.trim();
-  }
-  if (typeof persisted.workingDirectory === 'string') workingDirInput.value = persisted.workingDirectory;
-  if (typeof persisted.model === 'string') {
-    hadPersistedModel = true;
-    const saved = persisted.model.trim();
-    const known = new Set(['', 'gpt-5.2', 'gpt-5.2-codex']);
-    if (known.has(saved)) {
-      modelSelect.value = saved;
-      modelCustomInput.value = '';
-    } else {
-      modelSelect.value = MODEL_CUSTOM;
-      modelCustomInput.value = saved;
-    }
-  }
-  if (typeof persisted.modelReasoningEffort === 'string') reasoningSelect.value = persisted.modelReasoningEffort;
-  if (typeof persisted.experimentalWindowsSandboxEnabled === 'boolean') windowsSandboxInput.checked = persisted.experimentalWindowsSandboxEnabled;
-  if (typeof persisted.sandboxMode === 'string') sandboxSelect.value = persisted.sandboxMode;
-  if (typeof persisted.approvalPolicy === 'string') approvalSelect.value = persisted.approvalPolicy;
-  if (typeof persisted.networkAccessEnabled === 'string') netSelect.value = persisted.networkAccessEnabled;
-  if (typeof persisted.webSearchEnabled === 'string') webSelect.value = persisted.webSearchEnabled;
-  if (typeof persisted.skipGitRepoCheck === 'boolean') skipRepoInput.checked = persisted.skipGitRepoCheck;
-
-  if (!hadPersistedModel && !modelSelect.value) modelSelect.value = 'gpt-5.2';
-  updateModelUi();
-
   const updateWindowsSandboxUi = () => {
     const isWin = String(state.env?.platform || '') === 'win32';
     windowsSandboxField.style.display = isWin ? 'flex' : 'none';
@@ -1416,20 +1449,87 @@ export function mount({ container, host, slots }) {
     windowsSandboxHint.style.display = 'none';
   };
 
-  const persistRunSettings = () => {
-    saveRunSettings({
-      codexCommand: String(codexCommandInput.value || '').trim() || 'codex',
-      workingDirectory: String(workingDirInput.value || '').trim(),
-      model: getModelValue(),
-      modelReasoningEffort: String(reasoningSelect.value || '').trim(),
-      experimentalWindowsSandboxEnabled: Boolean(windowsSandboxInput.checked),
-      sandboxMode: String(sandboxSelect.value || '').trim(),
-      approvalPolicy: String(approvalSelect.value || '').trim(),
-      networkAccessEnabled: String(netSelect.value || '').trim(),
-      webSearchEnabled: String(webSelect.value || '').trim(),
-      skipGitRepoCheck: Boolean(skipRepoInput.checked),
-    });
+  const DEFAULT_RUN_SETTINGS = {
+    codexCommand: 'codex',
+    workingDirectory: '',
+    model: 'gpt-5.2',
+    modelReasoningEffort: '',
+    experimentalWindowsSandboxEnabled: false,
+    sandboxMode: 'workspace-write',
+    approvalPolicy: 'never',
+    networkAccessEnabled: '',
+    webSearchEnabled: '',
+    skipGitRepoCheck: false,
+    skipGitRepoCheckExplicit: false,
   };
+
+  let skipRepoExplicit = false;
+
+  const getDefaultRunSettings = () => {
+    const saved = loadRunSettings() || {};
+    return { ...DEFAULT_RUN_SETTINGS, ...saved };
+  };
+
+  const applyRunSettingsToControls = (settings) => {
+    const base = getDefaultRunSettings();
+    const next = { ...base, ...(settings || {}) };
+    const explicitFlag =
+      typeof next.skipGitRepoCheckExplicit === 'boolean'
+        ? next.skipGitRepoCheckExplicit
+        : typeof (settings || {}).skipGitRepoCheck === 'boolean'
+          ? true
+          : typeof (loadRunSettings() || {}).skipGitRepoCheck === 'boolean';
+    skipRepoExplicit = Boolean(explicitFlag);
+
+    codexCommandInput.value = String(next.codexCommand || 'codex').trim() || 'codex';
+    workingDirInput.value = typeof next.workingDirectory === 'string' ? next.workingDirectory : '';
+
+    const modelValue = typeof next.model === 'string' ? next.model.trim() : '';
+    const knownModels = new Set(['', 'gpt-5.2', 'gpt-5.2-codex']);
+    if (knownModels.has(modelValue)) {
+      modelSelect.value = modelValue;
+      modelCustomInput.value = '';
+    } else if (modelValue) {
+      modelSelect.value = MODEL_CUSTOM;
+      modelCustomInput.value = modelValue;
+    } else {
+      modelSelect.value = base.model;
+      modelCustomInput.value = '';
+    }
+
+    reasoningSelect.value = typeof next.modelReasoningEffort === 'string' ? next.modelReasoningEffort : '';
+    windowsSandboxInput.checked = Boolean(next.experimentalWindowsSandboxEnabled);
+    sandboxSelect.value = String(next.sandboxMode || '');
+    approvalSelect.value = String(next.approvalPolicy || '');
+    netSelect.value = String(next.networkAccessEnabled || '');
+    webSelect.value = String(next.webSearchEnabled || '');
+    skipRepoInput.checked = Boolean(next.skipGitRepoCheck);
+
+    updateModelUi();
+    updateWindowsSandboxUi();
+  };
+
+  const buildRunSettingsSnapshot = () => ({
+    codexCommand: String(codexCommandInput.value || '').trim() || 'codex',
+    workingDirectory: String(workingDirInput.value || '').trim(),
+    model: getModelValue(),
+    modelReasoningEffort: String(reasoningSelect.value || '').trim(),
+    experimentalWindowsSandboxEnabled: Boolean(windowsSandboxInput.checked),
+    sandboxMode: String(sandboxSelect.value || '').trim(),
+    approvalPolicy: String(approvalSelect.value || '').trim(),
+    networkAccessEnabled: String(netSelect.value || '').trim(),
+    webSearchEnabled: String(webSelect.value || '').trim(),
+    skipGitRepoCheck: Boolean(skipRepoInput.checked),
+    skipGitRepoCheckExplicit: skipRepoExplicit,
+  });
+
+  const persistRunSettings = () => {
+    const settings = buildRunSettingsSnapshot();
+    saveRunSettings(settings);
+    if (state.selectedWindowId) saveWindowRunSettings(state.selectedWindowId, settings);
+  };
+
+  applyRunSettingsToControls();
 
   codexCommandInput.addEventListener('input', persistRunSettings);
   workingDirInput.addEventListener('input', persistRunSettings);
@@ -1450,7 +1550,10 @@ export function mount({ container, host, slots }) {
   approvalSelect.addEventListener('change', persistRunSettings);
   netSelect.addEventListener('change', persistRunSettings);
   webSelect.addEventListener('change', persistRunSettings);
-  skipRepoInput.addEventListener('change', persistRunSettings);
+  skipRepoInput.addEventListener('change', () => {
+    skipRepoExplicit = true;
+    persistRunSettings();
+  });
   btnPickWorkingDir.addEventListener('click', async () => {
     const prevLabel = String(btnPickWorkingDir.textContent || '选择…');
     btnPickWorkingDir.disabled = true;
@@ -1480,7 +1583,7 @@ export function mount({ container, host, slots }) {
       workingDirStatus.textContent = `已设置：${picked}`;
 
       // If user never explicitly set --skip-git-repo-check, auto-tune it based on the chosen folder.
-      if (typeof persisted.skipGitRepoCheck !== 'boolean') {
+      if (!skipRepoExplicit) {
         try {
           const git = await invoke('codexGetGitInfo', { cwd: picked });
           skipRepoInput.checked = !Boolean(git?.isGitRepo);
@@ -1831,21 +1934,6 @@ export function mount({ container, host, slots }) {
   const refresh = async () => {
     try {
       state.env = await invoke('codexGetEnv');
-      const defaultCd = state.env?.sessionRootGitRoot || state.env?.cwdGitRoot || state.env?.sessionRoot || '';
-      if (defaultCd && !workingDirInput.value) workingDirInput.value = String(defaultCd);
-      if (typeof persisted.skipGitRepoCheck !== 'boolean') {
-        const cd = String(workingDirInput.value || '').trim();
-        if (cd) {
-          try {
-            const git = await invoke('codexGetGitInfo', { cwd: cd });
-            skipRepoInput.checked = !Boolean(git?.isGitRepo);
-            persistRunSettings();
-          } catch {
-            // ignore
-          }
-        }
-      }
-      updateWindowsSandboxUi();
     } catch {
       // ignore
     }
@@ -1860,6 +1948,26 @@ export function mount({ container, host, slots }) {
       const created = await invoke('codexCreateWindow', {});
       if (created?.window) state.windows.push(created.window);
       state.selectedWindowId = state.windows[0]?.id || '';
+    }
+
+    const defaultSettings = getDefaultRunSettings();
+    state.windows.forEach((win) => {
+      ensureWindowRunSettings(win?.id, defaultSettings);
+    });
+    applyRunSettingsToControls(ensureWindowRunSettings(state.selectedWindowId, defaultSettings));
+    const defaultCd = state.env?.sessionRootGitRoot || state.env?.cwdGitRoot || state.env?.sessionRoot || '';
+    if (defaultCd && !workingDirInput.value) workingDirInput.value = String(defaultCd);
+    if (!skipRepoExplicit) {
+      const cd = String(workingDirInput.value || '').trim();
+      if (cd) {
+        try {
+          const git = await invoke('codexGetGitInfo', { cwd: cd });
+          skipRepoInput.checked = !Boolean(git?.isGitRepo);
+          persistRunSettings();
+        } catch {
+          // ignore
+        }
+      }
     }
 
     for (const win of state.windows) {
@@ -1892,6 +2000,7 @@ export function mount({ container, host, slots }) {
     try {
       const res = await invoke('codexCreateWindow', {});
       if (res?.window) {
+        saveWindowRunSettings(res.window.id, buildRunSettingsSnapshot());
         state.windows.push(res.window);
         setSelectedWindow(res.window.id);
       }
