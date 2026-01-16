@@ -318,28 +318,38 @@ export function mount({ container, host, slots }) {
     return wrap;
   };
 
-  const mkGroup = (title, { subtitle = '' } = {}) => {
+  const mkGroup = (title, { subtitle = '', compact = false } = {}) => {
+    const groupPadding = compact ? '8px 10px' : '12px';
+    const groupGap = compact ? '6px' : '10px';
+    const headGap = compact ? '6px' : '10px';
+    const bodyGap = compact ? '8px' : '10px';
     const wrap = el('div', {
       border: `1px solid ${colors.border}`,
       borderRadius: '14px',
       background: colors.panelHover,
-      padding: '12px',
+      padding: groupPadding,
       display: 'flex',
       flexDirection: 'column',
-      gap: '10px',
+      gap: groupGap,
       backdropFilter: 'blur(10px)',
       WebkitBackdropFilter: 'blur(10px)',
     });
-    const head = el('div', { display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap' });
-    const h = el('div', { fontWeight: '850', color: colors.textStrong, letterSpacing: '0.2px' });
+    const head = el('div', {
+      display: 'flex',
+      alignItems: compact ? 'center' : 'baseline',
+      justifyContent: 'space-between',
+      gap: headGap,
+      flexWrap: 'wrap',
+    });
+    const h = el('div', { fontWeight: '850', color: colors.textStrong, letterSpacing: '0.2px', fontSize: compact ? '13px' : '' });
     h.textContent = title;
     head.appendChild(h);
     if (subtitle) {
-      const s = el('div', { fontSize: '12px', color: colors.textMuted });
+      const s = el('div', { fontSize: compact ? '11px' : '12px', color: colors.textMuted });
       s.textContent = subtitle;
       head.appendChild(s);
     }
-    const body = el('div', { display: 'grid', gap: '10px' });
+    const body = el('div', { display: 'grid', gap: bodyGap });
     wrap.appendChild(head);
     wrap.appendChild(body);
     return { wrap, body };
@@ -2160,21 +2170,24 @@ export function mount({ container, host, slots }) {
   promptInput.placeholder = '输入要给 Codex 的 prompt（通过 stdin 传入 codex exec）…';
   Object.assign(promptInput.style, {
     width: '100%',
-    minHeight: '100px',
+    minHeight: '64px',
     boxSizing: 'border-box',
     borderRadius: '14px',
     border: `1px solid ${colors.borderStrong}`,
     background: colors.bg,
-    padding: '10px 10px',
+    padding: '8px 10px',
     resize: 'vertical',
     outline: 'none',
     color: colors.textStrong,
   });
 
-  const { wrap: promptGroup, body: promptBody } = mkGroup('输入', { subtitle: '这里的内容会通过 stdin 传给 codex exec' });
+  const { wrap: promptGroup, body: promptBody } = mkGroup('输入', {
+    subtitle: '这里的内容会通过 stdin 传给 codex exec',
+    compact: true,
+  });
   promptBody.appendChild(promptInput);
 
-  const controls = el('div', { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' });
+  const controls = el('div', { display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' });
   const btnRun = mkBtn('运行', { variant: 'primary' });
   const btnAbort = mkBtn('停止', { variant: 'danger' });
   const btnClear = mkBtn('清空日志');
@@ -2183,13 +2196,26 @@ export function mount({ container, host, slots }) {
   const { wrap: scrollWrap, input: scrollInput } = mkCheckbox('自动滚动');
   scrollInput.checked = true;
 
+  [btnRun, btnAbort, btnClear].forEach((btn) => {
+    btn.style.padding = '6px 10px';
+    btn.style.borderRadius = '10px';
+    btn.style.fontSize = '12px';
+  });
+  [rawWrap, scrollWrap].forEach((wrap) => {
+    wrap.style.gap = '6px';
+    wrap.style.fontSize = '12px';
+  });
+
   controls.appendChild(btnRun);
   controls.appendChild(btnAbort);
   controls.appendChild(btnClear);
   controls.appendChild(rawWrap);
   controls.appendChild(scrollWrap);
 
-  const { wrap: controlGroup, body: controlBody } = mkGroup('操作', { subtitle: '运行、停止、清理，以及显示选项' });
+  const { wrap: controlGroup, body: controlBody } = mkGroup('操作', {
+    subtitle: '运行、停止、清理，以及显示选项',
+    compact: true,
+  });
   controlBody.appendChild(controls);
 
   const viewBar = el('div', { display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '10px', flexWrap: 'wrap' });
