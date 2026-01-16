@@ -25,6 +25,498 @@ export function mount({ container, host }) {
     tasks: [],
   };
 
+  const LOG_ITEM_CHAR_LIMIT = 800;
+  const LOG_TOOL_IO_CHAR_LIMIT = 1200;
+  const TOOL_ITEM_TYPES = new Set(['command_execution', 'mcp_tool_call', 'web_search']);
+  const MESSAGE_ITEM_TYPES = new Set(['agent_message', 'assistant_message', 'message']);
+
+  const formatTime = (ts) => {
+    const s = String(ts || '');
+    if (s.length >= 19 && s.includes('T')) return s.slice(11, 19);
+    return s || new Date().toISOString().slice(11, 19);
+  };
+
+  const normalizeText = (value) => String(value ?? '').replace(/\r\n?/g, '\n');
+
+  const truncateText = (value, limit) => {
+    const text = normalizeText(value);
+    if (!text) return { text: '', truncated: false, originalLength: 0 };
+    const max = Number(limit);
+    if (!Number.isFinite(max) || max <= 0 || text.length <= max) {
+      return { text, truncated: false, originalLength: text.length };
+    }
+    const keep = Math.max(0, max - 32);
+    const trimmed = text.slice(0, keep).trimEnd();
+    return { text: `${trimmed}…(truncated, originalLength=${text.length})`, truncated: true, originalLength: text.length };
+  };
+
+  const collapseWhitespace = (value) => normalizeText(value).replace(/\s+/g, ' ').trim();
+
+  const stringifyValue = (value) => {
+    if (value === undefined || value === null) return '';
+    if (typeof value === 'string') return value;
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  };
+
+  const looksLikeMarkdown = (value) => {
+    const text = normalizeText(value);
+    if (!text) return false;
+    if (text.includes('```')) return true;
+    if (/(^|\n)\s{0,3}#{1,6}\s+\S+/.test(text)) return true;
+    if (/(^|\n)\s*([-*+]|\d+\.)\s+\S+/.test(text)) return true;
+    if (/(^|\n)\|.+\|/.test(text)) return true;
+    return false;
+  };
+
+  const ensureClosedFences = (value) => {
+    const text = normalizeText(value);
+    const matches = text.match(/```/g);
+    if (matches && matches.length % 2 === 1) return `${text}\n\`\`\``;
+    return text;
+  };
+
+  const formatValueForMarkdown = (value, { limit, forceCodeBlock = false, codeLang = '' } = {}) => {
+    const raw = stringifyValue(value);
+    if (!raw) return { markdown: '', preview: '', truncated: false, originalLength: 0 };
+    const trimmed = truncateText(raw, limit);
+    if (forceCodeBlock || typeof value === 'object' || (raw.includes('\n') && !looksLikeMarkdown(raw))) {
+      const lang = codeLang || (typeof value === 'object' ? 'json' : '');
+      const fence = lang ? `\`\`\`${lang}` : '```';
+      return {
+        markdown: `${fence}\n${trimmed.text}\n\`\`\``,
+        preview: trimmed.text,
+        truncated: trimmed.truncated,
+        originalLength: trimmed.originalLength,
+      };
+    }
+    const content = trimmed.truncated ? ensureClosedFences(trimmed.text) : trimmed.text;
+    return { markdown: content, preview: trimmed.text, truncated: trimmed.truncated, originalLength: trimmed.originalLength };
+  };
+
+  const appendBoldNodes = (parent, text) => {
+    if (!text) return;
+    let pos = 0;
+    while (pos < text.length) {
+      const start = text.indexOf('**', pos);
+      if (start === -1) {
+        parent.appendChild(document.createTextNode(text.slice(pos)));
+        return;
+      }
+      const end = text.indexOf('**', start + 2);
+      if (end === -1) {
+        parent.appendChild(document.createTextNode(text.slice(pos)));
+        return;
+      }
+      if (start > pos) parent.appendChild(document.createTextNode(text.slice(pos, start)));
+      const strong = document.createElement('strong');
+      strong.textContent = text.slice(start + 2, end);
+      parent.appendChild(strong);
+      pos = end + 2;
+    }
+  };
+
+  const appendInlineNodes = (parent, text) => {
+    if (!text) return;
+    const parts = text.split('`');
+    parts.forEach((part, idx) => {
+      if (idx % 2 === 1) {
+        const code = document.createElement('code');
+        code.textContent = part;
+        code.style.fontFamily =
+          'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+        code.style.background = 'var(--ds-code-bg, var(--codex-compact-code-bg))';
+        code.style.border = '1px solid var(--ds-code-border, var(--codex-compact-code-border))';
+        code.style.borderRadius = '6px';
+        code.style.padding = '1px 3px';
+        parent.appendChild(code);
+        return;
+      }
+      appendBoldNodes(parent, part);
+    });
+  };
+
+  const renderMarkdown = (markdown) => {
+    const fragment = document.createDocumentFragment();
+    const text = normalizeText(markdown);
+    if (!text) return fragment;
+
+    const lines = text.split('\n');
+    let inCode = false;
+    let codeLines = [];
+    let listEl = null;
+    let listType = '';
+    let paragraph = [];
+
+    const flushParagraph = () => {
+      if (!paragraph.length) return;
+      const p = document.createElement('p');
+      p.style.margin = '0';
+      p.style.fontSize = '11px';
+      p.style.lineHeight = '1.4';
+      appendInlineNodes(p, paragraph.join('\n'));
+      fragment.appendChild(p);
+      paragraph = [];
+    };
+
+    const flushList = () => {
+      if (!listEl) return;
+      fragment.appendChild(listEl);
+      listEl = null;
+      listType = '';
+    };
+
+    const flushCode = () => {
+      if (!inCode) return;
+      const pre = document.createElement('pre');
+      pre.style.margin = '0';
+      pre.style.padding = '6px';
+      pre.style.borderRadius = '8px';
+      pre.style.background = 'var(--ds-code-bg, var(--codex-compact-code-bg))';
+      pre.style.border = '1px solid var(--ds-code-border, var(--codex-compact-code-border))';
+      pre.style.overflow = 'auto';
+      const code = document.createElement('code');
+      code.textContent = codeLines.join('\n');
+      code.style.fontFamily =
+        'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      code.style.fontSize = '10px';
+      pre.appendChild(code);
+      fragment.appendChild(pre);
+      codeLines = [];
+      inCode = false;
+    };
+
+    for (const line of lines) {
+      const fenceMatch = line.match(/^```(\w+)?\s*$/);
+      if (fenceMatch) {
+        flushParagraph();
+        flushList();
+        if (inCode) flushCode();
+        else {
+          inCode = true;
+          codeLines = [];
+        }
+        continue;
+      }
+
+      if (inCode) {
+        codeLines.push(line);
+        continue;
+      }
+
+      const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+      if (headingMatch) {
+        flushParagraph();
+        flushList();
+        const h = document.createElement('div');
+        h.style.fontWeight = '700';
+        h.style.fontSize = '12px';
+        appendInlineNodes(h, headingMatch[2]);
+        fragment.appendChild(h);
+        continue;
+      }
+
+      const orderedMatch = line.match(/^\s*(\d+)\.\s+(.*)$/);
+      const unorderedMatch = line.match(/^\s*[-*+]\s+(.*)$/);
+      if (orderedMatch || unorderedMatch) {
+        flushParagraph();
+        const nextType = orderedMatch ? 'ol' : 'ul';
+        if (!listEl || listType !== nextType) {
+          flushList();
+          listType = nextType;
+          listEl = document.createElement(nextType);
+          listEl.style.margin = '0 0 0 16px';
+          listEl.style.padding = '0';
+          listEl.style.fontSize = '11px';
+          listEl.style.lineHeight = '1.4';
+        }
+        const li = document.createElement('li');
+        appendInlineNodes(li, orderedMatch ? orderedMatch[2] : unorderedMatch[1]);
+        listEl.appendChild(li);
+        continue;
+      }
+
+      if (!line.trim()) {
+        flushParagraph();
+        flushList();
+        continue;
+      }
+
+      paragraph.push(line);
+    }
+
+    flushParagraph();
+    flushList();
+    flushCode();
+    return fragment;
+  };
+
+  const pickFirst = (...values) => {
+    for (const value of values) {
+      if (value === undefined || value === null) continue;
+      if (typeof value === 'string' && value === '') continue;
+      return value;
+    }
+    return '';
+  };
+
+  const shouldSurfaceStderr = (text) => {
+    const raw = String(text || '').trim();
+    if (!raw) return false;
+    const lower = raw.toLowerCase();
+    if (lower.includes('needs_follow_up')) return false;
+    if (lower.includes('traceback') || lower.includes('exception') || lower.includes('error') || lower.includes('failed')) return true;
+    return false;
+  };
+
+  const formatToolName = (item) => {
+    const type = String(item?.type || '');
+    if (type === 'mcp_tool_call') {
+      const server = String(item?.server || '').trim();
+      const tool = String(item?.tool || '').trim();
+      const name = [server, tool].filter(Boolean).join('.');
+      return name ? `mcp ${name}` : 'mcp';
+    }
+    if (type === 'command_execution') return 'command';
+    if (type === 'web_search') return 'web_search';
+    return type || 'tool';
+  };
+
+  const extractToolIO = (item) => {
+    if (!item || typeof item !== 'object') return { input: '', output: '' };
+    const type = String(item?.type || '');
+    if (type === 'command_execution') {
+      const output = pickFirst(item.aggregated_output, item.output, item.result);
+      return { input: pickFirst(item.command), output };
+    }
+    if (type === 'web_search') {
+      const output = pickFirst(item.result, item.results, item.output);
+      return { input: pickFirst(item.query, item.input), output };
+    }
+    if (type === 'mcp_tool_call') {
+      const input = pickFirst(item.input, item.arguments, item.params, item.request, item.args, item.call, item.tool_input, item.toolInput);
+      const output = pickFirst(item.output, item.result, item.response, item.tool_output, item.toolOutput, item.data);
+      return { input, output };
+    }
+    const input = pickFirst(item.input, item.arguments, item.params, item.command);
+    const output = pickFirst(item.output, item.result, item.response, item.aggregated_output);
+    return { input, output };
+  };
+
+  const buildMessageEntry = (time, text, { kind = 'message', title = '助手' } = {}) => {
+    const trimmed = truncateText(text, LOG_ITEM_CHAR_LIMIT);
+    const markdown = trimmed.truncated ? ensureClosedFences(trimmed.text) : trimmed.text;
+    const line = [time ? `[${time}]` : '', title, collapseWhitespace(trimmed.text)].filter(Boolean).join(' ');
+    return { kind, time, title, markdown, line };
+  };
+
+  const buildMetaEntry = (time, text) => {
+    const trimmed = truncateText(text, LOG_ITEM_CHAR_LIMIT);
+    const line = [time ? `[${time}]` : '', trimmed.text].filter(Boolean).join(' ');
+    return { kind: 'meta', time, text: trimmed.text, line };
+  };
+
+  const buildToolEntry = (time, item) => {
+    const name = formatToolName(item);
+    const statusParts = [];
+    if (item?.status) statusParts.push(String(item.status));
+    if (item?.exit_code !== undefined && item.exit_code !== null) statusParts.push(`exit=${item.exit_code}`);
+    if (item?.ok === false && !statusParts.includes('failed')) statusParts.push('failed');
+    const statusText = statusParts.join(' ');
+
+    const { input, output: rawOutput } = extractToolIO(item);
+    let output = rawOutput;
+    if (!output) {
+      output = pickFirst(item?.error?.message, item?.error, item?.error_message, item?.errorMessage);
+    }
+    const inputLang = item?.type === 'command_execution' ? 'bash' : typeof input === 'object' ? 'json' : 'text';
+    const inputBlock = formatValueForMarkdown(input, { limit: LOG_TOOL_IO_CHAR_LIMIT, forceCodeBlock: true, codeLang: inputLang });
+    const outputBlock = formatValueForMarkdown(output, { limit: LOG_TOOL_IO_CHAR_LIMIT });
+
+    const line = [time ? `[${time}]` : '', `tool ${name}`, statusText].filter(Boolean).join(' ');
+    return {
+      kind: 'tool',
+      time,
+      title: '工具',
+      tool: { name, status: statusText, input: inputBlock, output: outputBlock },
+      line,
+    };
+  };
+
+  const buildLogEntry = (evt) => {
+    if (typeof evt === 'string' || evt?.line) {
+      const time = evt?.ts ? formatTime(evt.ts) : '';
+      return buildMetaEntry(time, typeof evt === 'string' ? evt : String(evt?.line || ''));
+    }
+    if (!evt || typeof evt !== 'object') return null;
+    const time = formatTime(evt?.ts || new Date().toISOString());
+
+    if (evt?.source === 'system') {
+      if (evt.kind === 'error') return buildMessageEntry(time, evt?.error?.message || evt.message || '', { kind: 'error', title: '错误' });
+      if (evt.kind === 'warning') return buildMessageEntry(time, evt.message || evt.warning || '', { kind: 'warning', title: '警告' });
+      if (evt.kind === 'status') {
+        const status = String(evt.status || '');
+        if (status === 'failed' || status === 'aborted') {
+          return buildMessageEntry(time, `status ${status}`, { kind: 'warning', title: '状态' });
+        }
+      }
+      return null;
+    }
+
+    if (evt?.source === 'stderr') {
+      if (!shouldSurfaceStderr(evt.text)) return null;
+      return buildMessageEntry(time, String(evt.text || '').trimEnd(), { kind: 'error', title: 'stderr' });
+    }
+
+    if (evt?.source === 'raw') return null;
+
+    if (evt?.source === 'codex') {
+      const e = evt.event || {};
+      if (e.type === 'turn.failed') return buildMessageEntry(time, e?.error?.message || '', { kind: 'error', title: '错误' });
+      if (e.type === 'error') return buildMessageEntry(time, e.message || '', { kind: 'error', title: '错误' });
+      if (e.type === 'item.completed') {
+        const item = e.item || {};
+        const itemType = String(item.type || '');
+        if (itemType === 'reasoning' || itemType === 'todo_list') return null;
+        if (MESSAGE_ITEM_TYPES.has(itemType)) {
+          const text = pickFirst(item.text, item.message, item.output_text, item.content);
+          if (!text) return null;
+          return buildMessageEntry(time, text, { kind: 'message', title: '助手' });
+        }
+        if (TOOL_ITEM_TYPES.has(itemType)) return buildToolEntry(time, item);
+      }
+    }
+
+    return null;
+  };
+
+  const mkTag = (text) => {
+    const tag = document.createElement('div');
+    tag.textContent = String(text || '');
+    tag.style.display = 'inline-flex';
+    tag.style.alignItems = 'center';
+    tag.style.justifyContent = 'center';
+    tag.style.padding = '2px 6px';
+    tag.style.borderRadius = '999px';
+    tag.style.border = '1px solid var(--ds-panel-border, var(--codex-compact-border))';
+    tag.style.background = 'var(--ds-subtle-bg, var(--codex-compact-subtle))';
+    tag.style.fontSize = '10px';
+    tag.style.fontWeight = '700';
+    tag.style.cursor = 'pointer';
+    return tag;
+  };
+
+  const renderToolBlock = (title, block) => {
+    const wrap = document.createElement('div');
+    wrap.style.display = 'flex';
+    wrap.style.flexDirection = 'column';
+    wrap.style.gap = '6px';
+    const label = document.createElement('div');
+    label.textContent = title;
+    label.style.fontSize = '10px';
+    label.style.fontWeight = '700';
+    label.style.color = 'var(--ds-text-secondary, var(--codex-compact-text-muted))';
+    wrap.appendChild(label);
+
+    if (!block?.markdown) {
+      const empty = document.createElement('div');
+      empty.textContent = '无';
+      empty.style.fontSize = '11px';
+      empty.style.color = 'var(--ds-text-secondary, var(--codex-compact-text-muted))';
+      wrap.appendChild(empty);
+      return wrap;
+    }
+
+    const body = document.createElement('div');
+    body.appendChild(renderMarkdown(block.markdown));
+    wrap.appendChild(body);
+    return wrap;
+  };
+
+  const renderLogEntry = (entry) => {
+    const card = document.createElement('div');
+    card.style.border = '1px solid var(--ds-panel-border, var(--codex-compact-border))';
+    card.style.borderRadius = '10px';
+    card.style.background = 'var(--ds-subtle-bg, var(--codex-compact-subtle))';
+    card.style.padding = '8px';
+    card.style.display = 'flex';
+    card.style.flexDirection = 'column';
+    card.style.gap = '6px';
+
+    if (entry.kind === 'error') {
+      card.style.border = '1px solid rgba(239,68,68,0.55)';
+      card.style.background = 'rgba(239,68,68,0.10)';
+    }
+
+    const meta = document.createElement('div');
+    meta.style.display = 'flex';
+    meta.style.flexWrap = 'wrap';
+    meta.style.gap = '6px';
+    meta.style.fontSize = '10px';
+    meta.style.color = 'var(--ds-text-secondary, var(--codex-compact-text-muted))';
+    if (entry.time) {
+      const time = document.createElement('div');
+      time.textContent = entry.time;
+      meta.appendChild(time);
+    }
+    if (entry.title) {
+      const label = document.createElement('div');
+      label.textContent = entry.title;
+      label.style.fontWeight = '700';
+      meta.appendChild(label);
+    }
+    card.appendChild(meta);
+
+    if (entry.kind === 'tool' && entry.tool) {
+      const details = document.createElement('details');
+      const summary = document.createElement('summary');
+      summary.style.display = 'flex';
+      summary.style.alignItems = 'center';
+      summary.style.gap = '6px';
+      summary.style.cursor = 'pointer';
+      summary.appendChild(mkTag(entry.tool.name));
+      if (entry.tool.status) {
+        const status = document.createElement('div');
+        status.textContent = entry.tool.status;
+        status.style.fontSize = '10px';
+        status.style.color = 'var(--ds-text-secondary, var(--codex-compact-text-muted))';
+        summary.appendChild(status);
+      }
+      details.appendChild(summary);
+
+      const body = document.createElement('div');
+      body.style.display = 'grid';
+      body.style.gap = '6px';
+      body.style.marginTop = '6px';
+      body.appendChild(renderToolBlock('入参', entry.tool.input));
+      body.appendChild(renderToolBlock('出参', entry.tool.output));
+      details.appendChild(body);
+
+      card.appendChild(details);
+      return card;
+    }
+
+    if (entry.kind === 'meta') {
+      const text = document.createElement('div');
+      text.textContent = entry.text || '';
+      text.style.fontSize = '11px';
+      text.style.whiteSpace = 'pre-wrap';
+      text.style.wordBreak = 'break-word';
+      text.style.fontFamily =
+        'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      card.appendChild(text);
+      return card;
+    }
+
+    const body = document.createElement('div');
+    body.appendChild(renderMarkdown(entry.markdown || ''));
+    card.appendChild(body);
+    return card;
+  };
+
   const root = document.createElement('div');
   root.style.height = '100%';
   root.style.boxSizing = 'border-box';
@@ -215,7 +707,7 @@ export function mount({ container, host }) {
   logTitle.style.fontSize = '12px';
   logTitle.style.color = 'var(--ds-text-secondary, var(--codex-compact-text-muted))';
 
-  const logEl = document.createElement('pre');
+  const logEl = document.createElement('div');
   logEl.style.margin = '0';
   logEl.style.flex = '1';
   logEl.style.minHeight = '120px';
@@ -224,10 +716,9 @@ export function mount({ container, host }) {
   logEl.style.borderRadius = '10px';
   logEl.style.border = '1px solid var(--ds-code-border, var(--codex-compact-code-border))';
   logEl.style.background = 'var(--ds-code-bg, var(--codex-compact-code-bg))';
-  logEl.style.fontSize = '11px';
-  logEl.style.lineHeight = '1.4';
-  logEl.style.whiteSpace = 'pre-wrap';
-  logEl.style.wordBreak = 'break-word';
+  logEl.style.display = 'flex';
+  logEl.style.flexDirection = 'column';
+  logEl.style.gap = '8px';
   logEl.style.color = 'var(--ds-text-primary, var(--codex-compact-text))';
 
   logPanel.appendChild(logTitle);
@@ -262,28 +753,6 @@ export function mount({ container, host }) {
   root.appendChild(inputPanel);
   root.appendChild(content);
 
-  const formatEvent = (evt) => {
-    if (!evt) return '';
-    if (typeof evt === 'string') return evt;
-    if (evt?.line) return String(evt.line);
-    if (evt?.source === 'stderr') return `[stderr] ${String(evt.text || '').trimEnd()}`;
-    if (evt?.source === 'raw') return `[raw] ${String(evt.text || '').trimEnd()}`;
-    if (evt?.source === 'system') {
-      if (evt.kind === 'status') return `[status] ${String(evt.status || '')}`;
-      if (evt.kind === 'warning') return `[warning] ${String(evt.message || '')}`;
-      if (evt.kind === 'error') return `[error] ${String(evt?.error?.message || evt.message || '')}`;
-    }
-    if (evt?.source === 'codex' && evt?.event) {
-      const type = String(evt.event.type || 'event');
-      return `[codex] ${type}`;
-    }
-    try {
-      return JSON.stringify(evt);
-    } catch {
-      return String(evt);
-    }
-  };
-
   const setStatusMeta = () => {
     const win = state.windows.find((w) => w.id === state.selectedWindowId) || null;
     const status = win ? String(win.status || 'idle') : 'idle';
@@ -306,12 +775,27 @@ export function mount({ container, host }) {
   };
 
   const renderLogs = () => {
+    logEl.textContent = '';
     if (!state.logs.length) {
-      logEl.textContent = '暂无日志';
+      const empty = document.createElement('div');
+      empty.textContent = '暂无日志';
+      empty.style.fontSize = '11px';
+      empty.style.color = 'var(--ds-text-secondary, var(--codex-compact-text-muted))';
+      logEl.appendChild(empty);
       return;
     }
-    const lines = state.logs.map(formatEvent).filter(Boolean);
-    logEl.textContent = lines.join('\n');
+
+    const entries = state.logs.map(buildLogEntry).filter(Boolean);
+    if (!entries.length) {
+      const empty = document.createElement('div');
+      empty.textContent = '暂无日志';
+      empty.style.fontSize = '11px';
+      empty.style.color = 'var(--ds-text-secondary, var(--codex-compact-text-muted))';
+      logEl.appendChild(empty);
+      return;
+    }
+
+    entries.forEach((entry) => logEl.appendChild(renderLogEntry(entry)));
     logEl.scrollTop = logEl.scrollHeight;
   };
 

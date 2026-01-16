@@ -18,10 +18,12 @@ How to send a message (prompt):
 - Use `threadId` to resume a conversation.
 - Use `options` to control execution (e.g., `model`, `workingDirectory`, `sandboxMode`, `approvalPolicy`).
 - The result includes the command, exit code, stdout/stderr.
+- If no window exists, `codex_app.codex_exec` will enqueue a new window (disable with `ensureWindow:false`).
 
 Window notes:
 
 - `codex_app.create_window` only enqueues a UI window request; it appears after UI refresh/poll.
+- `codex_app.create_window` defaults `workingDirectory`/`sandboxMode` to projectRoot/workspace-write when omitted.
 - There is no MCP tool to send a prompt into an existing window; use the UI to run inside a window.
 - `codex_app.get_window_logs`/`codex_app.get_window_tasks` read UI-generated logs and task snapshots.
 
@@ -31,6 +33,7 @@ Tools (full):
 - `codex_app.codex_version`: get codex version
 - `codex_app.codex_exec`: run `codex exec --json` via stdin
 - `codex_app.get_windows`: list windows with last/default run settings (model, reasoning, working dir, sandbox)
-- `codex_app.create_window`: create a window (requires `workingDirectory` and `sandboxMode`; defaults returned explicitly)
+- `codex_app.get_windows` also returns `preferredWindowId` / `preferredThreadId` as a hint.
+- `codex_app.create_window`: create a window (defaults for workingDirectory/sandboxMode are applied when omitted)
 - `codex_app.get_window_logs`: get window logs by line count (`limit` / `offset`, defaults to latest tail)
 - `codex_app.get_window_tasks`: get window task list (todo_list)

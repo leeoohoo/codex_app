@@ -99,12 +99,36 @@ const findUpwardsDataDir = (startPath, pluginId) => {
   return '';
 };
 
+const resolveDataDirFromStateDir = (stateDir) => {
+  const raw = normalizeString(stateDir);
+  if (!raw) return '';
+  return path.join(raw, 'ui_apps', 'data', PLUGIN_ID);
+};
+
+const resolveStateDirFromEnv = () => {
+  const direct =
+    normalizeString(process.env?.CHATOS_UI_APPS_STATE_DIR) ||
+    normalizeString(process.env?.CHATOS_STATE_DIR) ||
+    normalizeString(process.env?.MODEL_CLI_STATE_DIR);
+  if (direct) return direct;
+  const hostApp = normalizeString(process.env?.MODEL_CLI_HOST_APP) || 'chatos';
+  const sessionRoot = normalizeString(process.env?.MODEL_CLI_SESSION_ROOT);
+  const home = normalizeString(process.env?.HOME || process.env?.USERPROFILE);
+  const base = sessionRoot || home;
+  if (!base) return '';
+  return path.join(base, '.deepseek_cli', hostApp);
+};
+
+const resolveDataDirFromEnv = () => resolveDataDirFromStateDir(resolveStateDirFromEnv());
+
 const resolveDataDir = () => {
   const envDir =
     normalizeString(process.env?.CHATOS_UI_APPS_DATA_DIR) ||
     normalizeString(process.env?.CHATOS_UI_APP_DATA_DIR) ||
     normalizeString(process.env?.CHATOS_DATA_DIR);
   if (envDir) return envDir;
+  const fromEnv = resolveDataDirFromEnv();
+  if (fromEnv) return fromEnv;
   const fromCwd = findUpwardsDataDir(process.cwd(), PLUGIN_ID);
   if (fromCwd) return fromCwd;
   const fromPlugin = findUpwardsDataDir(pluginRoot, PLUGIN_ID);
@@ -115,12 +139,24 @@ const resolveDataDir = () => {
 const resolveDataDirFromMeta = (meta) => {
   const fromUiApp = normalizeString(meta?.chatos?.uiApp?.dataDir);
   if (fromUiApp) return fromUiApp;
+  const fromStateDir = resolveDataDirFromStateDir(meta?.chatos?.uiApp?.stateDir);
+  if (fromStateDir) return fromStateDir;
   const fromWorkdir = normalizeString(meta?.workdir);
   if (fromWorkdir) return fromWorkdir;
   return '';
 };
 
 const resolveDataDirWithMeta = (meta) => resolveDataDirFromMeta(meta) || resolveDataDir();
+
+const resolveDefaultWorkingDirectory = (meta) => {
+  const fromProject = normalizeString(meta?.chatos?.uiApp?.projectRoot);
+  if (fromProject) return fromProject;
+  const fromSession = normalizeString(meta?.chatos?.uiApp?.sessionRoot);
+  if (fromSession) return fromSession;
+  const fromWorkdir = normalizeString(meta?.workdir);
+  if (fromWorkdir) return fromWorkdir;
+  return process.cwd();
+};
 
 const getStateFile = (meta) => {
   const dataDir = resolveDataDirWithMeta(meta);
@@ -250,6 +286,24 @@ const formatRunEvent = (evt) => {
   return `[${ts}] ${JSON.stringify(evt).slice(0, 320)}`;
 };
 
+const parseWindowTime = (win) => {
+  const updated = Date.parse(win?.updatedAt || '') || 0;
+  if (updated) return updated;
+  return Date.parse(win?.createdAt || '') || 0;
+};
+
+const sortWindowsByRecent = (windows) =>
+  Array.isArray(windows) ? windows.slice().sort((a, b) => parseWindowTime(b) - parseWindowTime(a)) : [];
+
+const pickPreferredWindow = (windows) => {
+  if (!Array.isArray(windows) || !windows.length) return null;
+  const running = windows.find((win) => win?.status === 'running' || win?.status === 'aborting');
+  if (running) return running;
+  const withThread = windows.find((win) => normalizeString(win?.threadId));
+  if (withThread) return withThread;
+  return windows[0] || null;
+};
+
 const runProcess = async ({ command, args, input = '' }) => {
   const MAX_OUT = 160_000;
   const MAX_ERR = 60_000;
@@ -291,6 +345,25 @@ const runProcess = async ({ command, args, input = '' }) => {
   return { code, signal, stdout, stderr, spawn: spawnSpec };
 };
 
+const parseThreadIdFromStdout = (stdout) => {
+  const text = String(stdout || '');
+  if (!text) return '';
+  const lines = text.split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const evt = JSON.parse(trimmed);
+      if (evt?.type === 'thread.started' && typeof evt.thread_id === 'string') {
+        return evt.thread_id;
+      }
+    } catch {
+      // ignore parse errors
+    }
+  }
+  return '';
+};
+
 const toolResultText = (text) => ({
   content: [{ type: 'text', text: String(text ?? '') }],
 });
@@ -304,6 +377,22 @@ const clampNumber = (value, min, max) => {
 
 const loadState = (meta) =>
   readJsonFile(getStateFile(meta)) || { version: 0, windows: [], windowLogs: {}, windowTasks: {} };
+
+const buildDefaultsApplied = (input, meta) => {
+  const workingDirectory = normalizeString(input?.workingDirectory) || resolveDefaultWorkingDirectory(meta);
+  const sandboxMode = normalizeString(input?.sandboxMode) || 'workspace-write';
+  return {
+    workingDirectory,
+    sandboxMode,
+    model: normalizeString(input?.model) || DEFAULT_MODEL,
+    modelReasoningEffort: normalizeString(input?.modelReasoningEffort) || null,
+    approvalPolicy: normalizeString(input?.approvalPolicy) || DEFAULT_APPROVAL,
+    experimentalWindowsSandboxEnabled: input?.experimentalWindowsSandboxEnabled === undefined ? false : Boolean(input.experimentalWindowsSandboxEnabled),
+    networkAccessEnabled: input?.networkAccessEnabled === undefined ? null : Boolean(input.networkAccessEnabled),
+    webSearchEnabled: input?.webSearchEnabled === undefined ? null : Boolean(input.webSearchEnabled),
+    skipGitRepoCheck: input?.skipGitRepoCheck === undefined ? false : Boolean(input.skipGitRepoCheck),
+  };
+};
 
 const appendCreateWindowRequest = (entry, meta) => {
   const requestsFile = getRequestsFile(meta);
@@ -333,6 +422,9 @@ const TOOLS = [
       properties: {
         prompt: { type: 'string', description: 'Prompt passed to codex via stdin.' },
         threadId: { type: 'string', description: 'Optional thread id to resume.' },
+        windowId: { type: 'string', description: 'Optional. If set, use this window when creating a new UI window.' },
+        ensureWindow: { type: 'boolean', description: 'Optional. When no window exists, create one and attach this run.' },
+        windowName: { type: 'string', description: 'Optional. Name used if a new window is created.' },
         codexCommand: { type: 'string', description: 'Executable name or path (default: codex).' },
         options: {
           type: 'object',
@@ -359,14 +451,13 @@ const TOOLS = [
   {
     name: 'codex_app.create_window',
     description:
-      'Create a new window with required workingDirectory and sandboxMode. Returns explicit defaults applied to other fields.',
+      'Create a new window. workingDirectory/sandboxMode default to projectRoot/workspace-write if omitted. Returns explicit defaults applied to other fields.',
     inputSchema: {
       type: 'object',
-      required: ['workingDirectory', 'sandboxMode'],
       properties: {
         name: { type: 'string', description: 'Optional window name.' },
-        workingDirectory: { type: 'string', description: 'Required. Working directory passed to --cd.' },
-        sandboxMode: { type: 'string', description: 'Required. Sandbox mode (read-only/workspace-write/danger-full-access).' },
+        workingDirectory: { type: 'string', description: 'Optional. Working directory passed to --cd.' },
+        sandboxMode: { type: 'string', description: 'Optional. Sandbox mode (read-only/workspace-write/danger-full-access).' },
         model: { type: 'string', description: 'Optional. Defaults to gpt-5.2.' },
         modelReasoningEffort: { type: 'string', description: 'Optional. Defaults to codex config.' },
         approvalPolicy: { type: 'string', description: 'Optional. Defaults to never.' },
@@ -458,16 +549,41 @@ const handleRequest = async (req) => {
       if (!String(prompt || '').trim()) return jsonRpcError(id, -32602, 'prompt is required');
 
       const codexCommand = String(args?.codexCommand || 'codex').trim() || 'codex';
-      const threadId = typeof args?.threadId === 'string' ? args.threadId : '';
+      const state = loadState(params?._meta);
+      const windows = sortWindowsByRecent(Array.isArray(state?.windows) ? state.windows : []);
+      const windowId = normalizeString(args?.windowId);
+      const windowTarget = windowId ? windows.find((win) => win?.id === windowId) : null;
+      let threadId = typeof args?.threadId === 'string' ? args.threadId : '';
+      if (!threadId && windowTarget?.threadId) threadId = String(windowTarget.threadId || '');
       const options = args?.options && typeof args.options === 'object' ? args.options : {};
       const codexArgs = buildCodexExecArgs({ threadId: threadId || null, options });
 
       const res = await runProcess({ command: codexCommand, args: codexArgs, input: prompt });
+      const ensureWindow = args?.ensureWindow === undefined ? true : Boolean(args.ensureWindow);
+      const shouldCreateWindow = ensureWindow && (!windows.length || (windowId && !windowTarget));
+      let createdWindowId = '';
+      if (shouldCreateWindow) {
+        const derivedId = windowId || makeId();
+        const defaultsApplied = buildDefaultsApplied(options, params?._meta);
+        const threadIdFromOutput = parseThreadIdFromStdout(res.stdout) || '';
+        appendCreateWindowRequest(
+          {
+            id: derivedId,
+            name: normalizeString(args?.windowName) || '',
+            defaults: defaultsApplied,
+            threadId: threadIdFromOutput,
+            createdAt: new Date().toISOString(),
+          },
+          params?._meta,
+        );
+        createdWindowId = derivedId;
+      }
       const text = [
         `command: ${res.spawn.command} ${res.spawn.args.join(' ')}`,
         `exit: ${res.code ?? 'null'}${res.signal ? ` signal=${res.signal}` : ''}`,
         res.stdout ? `\nstdout:\n${res.stdout.trimEnd()}` : '',
         res.stderr ? `\nstderr:\n${res.stderr.trimEnd()}` : '',
+        createdWindowId ? `\nwindow: created ${createdWindowId} (pending UI refresh)` : '',
       ]
         .filter(Boolean)
         .join('\n');
@@ -476,34 +592,22 @@ const handleRequest = async (req) => {
 
     if (name === 'codex_app.get_windows') {
       const state = loadState(params?._meta);
-      const windows = Array.isArray(state?.windows) ? state.windows : [];
+      const windows = sortWindowsByRecent(Array.isArray(state?.windows) ? state.windows : []);
+      const preferred = pickPreferredWindow(windows);
       return jsonRpcResult(
         id,
         toolResultJson({
           version: state?.version || 0,
           updatedAt: state?.updatedAt || '',
           windows,
+          preferredWindowId: preferred?.id || '',
+          preferredThreadId: preferred?.threadId || '',
         }),
       );
     }
 
     if (name === 'codex_app.create_window') {
-      const workingDirectory = normalizeString(args?.workingDirectory);
-      const sandboxMode = normalizeString(args?.sandboxMode);
-      if (!workingDirectory) return jsonRpcError(id, -32602, 'workingDirectory is required');
-      if (!sandboxMode) return jsonRpcError(id, -32602, 'sandboxMode is required');
-
-      const defaultsApplied = {
-        workingDirectory,
-        sandboxMode,
-        model: normalizeString(args?.model) || DEFAULT_MODEL,
-        modelReasoningEffort: normalizeString(args?.modelReasoningEffort) || null,
-        approvalPolicy: normalizeString(args?.approvalPolicy) || DEFAULT_APPROVAL,
-        experimentalWindowsSandboxEnabled: args?.experimentalWindowsSandboxEnabled === undefined ? false : Boolean(args.experimentalWindowsSandboxEnabled),
-        networkAccessEnabled: args?.networkAccessEnabled === undefined ? null : Boolean(args.networkAccessEnabled),
-        webSearchEnabled: args?.webSearchEnabled === undefined ? null : Boolean(args.webSearchEnabled),
-        skipGitRepoCheck: args?.skipGitRepoCheck === undefined ? false : Boolean(args.skipGitRepoCheck),
-      };
+      const defaultsApplied = buildDefaultsApplied(args, params?._meta);
 
       const windowId = makeId();
       appendCreateWindowRequest(

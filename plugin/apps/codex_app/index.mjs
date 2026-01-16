@@ -185,6 +185,28 @@ export function mount({ container, host, slots }) {
 .codex-app-root ::-webkit-scrollbar-thumb{ background: rgba(148,163,184,0.35); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
 .codex-app-root ::-webkit-scrollbar-thumb:hover{ background: rgba(148,163,184,0.50); border: 2px solid transparent; background-clip: padding-box; }
 .codex-app-root ::-webkit-scrollbar-corner{ background: transparent; }
+.codex-log{ border:0; border-radius:14px; padding:12px; margin:0; overflow:auto; min-height:0; min-width:0; flex:1; background: var(--codex-log-bg); color: var(--codex-text-strong); display:flex; flex-direction:column; gap:10px; }
+.codex-log-empty{ font-size:12px; color: var(--codex-text-muted); }
+.codex-log-entry{ border:1px solid var(--codex-border); background: var(--codex-panel); border-radius:12px; padding:10px; display:flex; flex-direction:column; gap:8px; }
+.codex-log-entry--error{ border-color: var(--codex-danger-border); background: var(--codex-danger-bg); }
+.codex-log-entry--warning{ border-color: var(--codex-accent-border); }
+.codex-log-meta{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:11px; color: var(--codex-text-muted); }
+.codex-log-time{ font-variant-numeric: tabular-nums; }
+.codex-log-markdown{ font-size:13px; line-height:1.55; color: var(--codex-text-strong); display:flex; flex-direction:column; gap:6px; }
+.codex-log-markdown p{ margin:0; }
+.codex-log-markdown h1{ font-size:16px; margin:0; font-weight:800; }
+.codex-log-markdown h2{ font-size:15px; margin:0; font-weight:750; }
+.codex-log-markdown h3{ font-size:14px; margin:0; font-weight:700; }
+.codex-log-markdown h4, .codex-log-markdown h5, .codex-log-markdown h6{ font-size:13px; margin:0; font-weight:700; }
+.codex-log-markdown ul, .codex-log-markdown ol{ margin:0 0 0 18px; padding:0; }
+.codex-log-markdown pre{ margin:0; padding:8px; border-radius:10px; background: var(--codex-bg); border:1px solid var(--codex-border); overflow:auto; }
+.codex-log-markdown code{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; background: var(--codex-bg); border:1px solid var(--codex-border); border-radius:6px; padding:1px 4px; }
+.codex-log-tool summary{ list-style:none; cursor:pointer; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.codex-log-tool summary::-webkit-details-marker{ display:none; }
+.codex-log-tool-body{ display:grid; gap:8px; margin-top:8px; }
+.codex-log-tool-block{ display:flex; flex-direction:column; gap:6px; }
+.codex-log-tool-title{ font-size:11px; color: var(--codex-text-muted); text-transform:uppercase; letter-spacing:0.4px; font-weight:700; }
+.codex-log-meta-text{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size:12px; line-height:1.5; white-space: pre-wrap; }
 `;
   try {
     (document.head || document.documentElement).appendChild(styleEl);
@@ -354,6 +376,12 @@ export function mount({ container, host, slots }) {
     return badge;
   };
 
+  const mkTag = (text, { fg = colors.textStrong, bg = colors.bg, border = colors.accentBorder } = {}) => {
+    const tag = mkBadge(text, { fg, bg, border });
+    tag.style.cursor = 'pointer';
+    return tag;
+  };
+
   const state = {
     env: null,
     windows: [],
@@ -371,6 +399,8 @@ export function mount({ container, host, slots }) {
   const MAX_WINDOW_EVENTS = 2500;
   const TRIM_WINDOW_EVENTS_TO = 2000;
   const LOG_RENDER_CHAR_BUDGET = 250000;
+  const LOG_ITEM_CHAR_LIMIT = 2000;
+  const LOG_TOOL_IO_CHAR_LIMIT = 2000;
   const MAX_WINDOW_INPUTS = 500;
   const INPUT_PAGE_SIZE = 6;
 
@@ -526,6 +556,201 @@ export function mount({ container, host, slots }) {
     return s || new Date().toISOString().slice(11, 19);
   };
 
+  const normalizeText = (value) => String(value ?? '').replace(/\r\n?/g, '\n');
+
+  const truncateText = (value, limit) => {
+    const text = normalizeText(value);
+    if (!text) return { text: '', truncated: false, originalLength: 0 };
+    const max = Number(limit);
+    if (!Number.isFinite(max) || max <= 0 || text.length <= max) {
+      return { text, truncated: false, originalLength: text.length };
+    }
+    const keep = Math.max(0, max - 32);
+    const trimmed = text.slice(0, keep).trimEnd();
+    return { text: `${trimmed}…(truncated, originalLength=${text.length})`, truncated: true, originalLength: text.length };
+  };
+
+  const collapseWhitespace = (value) => normalizeText(value).replace(/\s+/g, ' ').trim();
+
+  const stringifyValue = (value) => {
+    if (value === undefined || value === null) return '';
+    if (typeof value === 'string') return value;
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  };
+
+  const looksLikeMarkdown = (value) => {
+    const text = normalizeText(value);
+    if (!text) return false;
+    if (text.includes('```')) return true;
+    if (/(^|\n)\s{0,3}#{1,6}\s+\S+/.test(text)) return true;
+    if (/(^|\n)\s*([-*+]|\d+\.)\s+\S+/.test(text)) return true;
+    if (/(^|\n)\|.+\|/.test(text)) return true;
+    return false;
+  };
+
+  const ensureClosedFences = (value) => {
+    const text = normalizeText(value);
+    const matches = text.match(/```/g);
+    if (matches && matches.length % 2 === 1) return `${text}\n\`\`\``;
+    return text;
+  };
+
+  const formatValueForMarkdown = (value, { limit, forceCodeBlock = false, codeLang = '' } = {}) => {
+    const raw = stringifyValue(value);
+    if (!raw) return { markdown: '', preview: '', truncated: false, originalLength: 0 };
+    const trimmed = truncateText(raw, limit);
+    if (forceCodeBlock || typeof value === 'object' || (raw.includes('\n') && !looksLikeMarkdown(raw))) {
+      const lang = codeLang || (typeof value === 'object' ? 'json' : '');
+      const fence = lang ? `\`\`\`${lang}` : '```';
+      return {
+        markdown: `${fence}\n${trimmed.text}\n\`\`\``,
+        preview: trimmed.text,
+        truncated: trimmed.truncated,
+        originalLength: trimmed.originalLength,
+      };
+    }
+    const content = trimmed.truncated ? ensureClosedFences(trimmed.text) : trimmed.text;
+    return { markdown: content, preview: trimmed.text, truncated: trimmed.truncated, originalLength: trimmed.originalLength };
+  };
+
+  const appendBoldNodes = (parent, text) => {
+    if (!text) return;
+    let pos = 0;
+    while (pos < text.length) {
+      const start = text.indexOf('**', pos);
+      if (start === -1) {
+        parent.appendChild(document.createTextNode(text.slice(pos)));
+        return;
+      }
+      const end = text.indexOf('**', start + 2);
+      if (end === -1) {
+        parent.appendChild(document.createTextNode(text.slice(pos)));
+        return;
+      }
+      if (start > pos) parent.appendChild(document.createTextNode(text.slice(pos, start)));
+      const strong = document.createElement('strong');
+      strong.textContent = text.slice(start + 2, end);
+      parent.appendChild(strong);
+      pos = end + 2;
+    }
+  };
+
+  const appendInlineNodes = (parent, text) => {
+    if (!text) return;
+    const parts = text.split('`');
+    parts.forEach((part, idx) => {
+      if (idx % 2 === 1) {
+        const code = document.createElement('code');
+        code.textContent = part;
+        parent.appendChild(code);
+        return;
+      }
+      appendBoldNodes(parent, part);
+    });
+  };
+
+  const renderMarkdown = (markdown) => {
+    const fragment = document.createDocumentFragment();
+    const text = normalizeText(markdown);
+    if (!text) return fragment;
+
+    const lines = text.split('\n');
+    let inCode = false;
+    let codeLines = [];
+    let listEl = null;
+    let listType = '';
+    let paragraph = [];
+
+    const flushParagraph = () => {
+      if (!paragraph.length) return;
+      const p = document.createElement('p');
+      appendInlineNodes(p, paragraph.join('\n'));
+      fragment.appendChild(p);
+      paragraph = [];
+    };
+
+    const flushList = () => {
+      if (!listEl) return;
+      fragment.appendChild(listEl);
+      listEl = null;
+      listType = '';
+    };
+
+    const flushCode = () => {
+      if (!inCode) return;
+      const pre = document.createElement('pre');
+      const code = document.createElement('code');
+      code.textContent = codeLines.join('\n');
+      pre.appendChild(code);
+      fragment.appendChild(pre);
+      codeLines = [];
+      inCode = false;
+    };
+
+    for (const line of lines) {
+      const fenceMatch = line.match(/^```(\w+)?\s*$/);
+      if (fenceMatch) {
+        flushParagraph();
+        flushList();
+        if (inCode) flushCode();
+        else {
+          inCode = true;
+          codeLines = [];
+        }
+        continue;
+      }
+
+      if (inCode) {
+        codeLines.push(line);
+        continue;
+      }
+
+      const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+      if (headingMatch) {
+        flushParagraph();
+        flushList();
+        const level = Math.min(6, headingMatch[1].length);
+        const h = document.createElement(`h${level}`);
+        appendInlineNodes(h, headingMatch[2]);
+        fragment.appendChild(h);
+        continue;
+      }
+
+      const orderedMatch = line.match(/^\s*(\d+)\.\s+(.*)$/);
+      const unorderedMatch = line.match(/^\s*[-*+]\s+(.*)$/);
+      if (orderedMatch || unorderedMatch) {
+        flushParagraph();
+        const nextType = orderedMatch ? 'ol' : 'ul';
+        if (!listEl || listType !== nextType) {
+          flushList();
+          listType = nextType;
+          listEl = document.createElement(nextType);
+        }
+        const li = document.createElement('li');
+        appendInlineNodes(li, orderedMatch ? orderedMatch[2] : unorderedMatch[1]);
+        listEl.appendChild(li);
+        continue;
+      }
+
+      if (!line.trim()) {
+        flushParagraph();
+        flushList();
+        continue;
+      }
+
+      paragraph.push(line);
+    }
+
+    flushParagraph();
+    flushList();
+    flushCode();
+    return fragment;
+  };
+
   const clampNumber = (value, min, max) => {
     const n = Number(value);
     if (!Number.isFinite(n)) return min;
@@ -656,51 +881,265 @@ export function mount({ container, host, slots }) {
   const isLineItem = (evt) => typeof evt === 'string' || (evt && typeof evt === 'object' && typeof evt.line === 'string');
   const getLineText = (evt) => (typeof evt === 'string' ? evt : String(evt?.line || ''));
 
-  const buildLogModel = (windowId) => {
-    const events = getEvents(windowId);
-    if (!events.length) return { items: [], lines: [] };
+  const TOOL_ITEM_TYPES = new Set(['command_execution', 'mcp_tool_call', 'web_search']);
+  const MESSAGE_ITEM_TYPES = new Set(['agent_message', 'assistant_message', 'message']);
 
+  const pickFirst = (...values) => {
+    for (const value of values) {
+      if (value === undefined || value === null) continue;
+      if (typeof value === 'string' && value === '') continue;
+      return value;
+    }
+    return '';
+  };
+
+  const shouldSurfaceStderr = (text) => {
+    const raw = String(text || '').trim();
+    if (!raw) return false;
+    const lower = raw.toLowerCase();
+    if (lower.includes('needs_follow_up')) return false;
+    if (lower.includes('traceback') || lower.includes('exception') || lower.includes('error') || lower.includes('failed')) return true;
+    return false;
+  };
+
+  const formatToolName = (item) => {
+    const type = String(item?.type || '');
+    if (type === 'mcp_tool_call') {
+      const server = String(item?.server || '').trim();
+      const tool = String(item?.tool || '').trim();
+      const name = [server, tool].filter(Boolean).join('.');
+      return name ? `mcp ${name}` : 'mcp';
+    }
+    if (type === 'command_execution') return 'command';
+    if (type === 'web_search') return 'web_search';
+    return type || 'tool';
+  };
+
+  const extractToolIO = (item) => {
+    if (!item || typeof item !== 'object') return { input: '', output: '' };
+    const type = String(item?.type || '');
+    if (type === 'command_execution') {
+      const output = pickFirst(item.aggregated_output, item.output, item.result);
+      return { input: pickFirst(item.command), output };
+    }
+    if (type === 'web_search') {
+      const output = pickFirst(item.result, item.results, item.output);
+      return { input: pickFirst(item.query, item.input), output };
+    }
+    if (type === 'mcp_tool_call') {
+      const input = pickFirst(item.input, item.arguments, item.params, item.request, item.args, item.call, item.tool_input, item.toolInput);
+      const output = pickFirst(item.output, item.result, item.response, item.tool_output, item.toolOutput, item.data);
+      return { input, output };
+    }
+    const input = pickFirst(item.input, item.arguments, item.params, item.command);
+    const output = pickFirst(item.output, item.result, item.response, item.aggregated_output);
+    return { input, output };
+  };
+
+  const buildMessageEntry = (time, text, { kind = 'message', title = '助手' } = {}) => {
+    const trimmed = truncateText(text, LOG_ITEM_CHAR_LIMIT);
+    const markdown = trimmed.truncated ? ensureClosedFences(trimmed.text) : trimmed.text;
+    const line = [time ? `[${time}]` : '', title, collapseWhitespace(trimmed.text)].filter(Boolean).join(' ');
+    return { kind, time, title, markdown, line, cost: trimmed.text.length + 1 };
+  };
+
+  const buildMetaEntry = (time, text) => {
+    const trimmed = truncateText(text, LOG_ITEM_CHAR_LIMIT);
+    const line = [time ? `[${time}]` : '', trimmed.text].filter(Boolean).join(' ');
+    return { kind: 'meta', time, text: trimmed.text, line, cost: trimmed.text.length + 1 };
+  };
+
+  const buildToolEntry = (time, item) => {
+    const name = formatToolName(item);
+    const statusParts = [];
+    if (item?.status) statusParts.push(String(item.status));
+    if (item?.exit_code !== undefined && item.exit_code !== null) statusParts.push(`exit=${item.exit_code}`);
+    if (item?.ok === false && !statusParts.includes('failed')) statusParts.push('failed');
+    const statusText = statusParts.join(' ');
+
+    const { input, output: rawOutput } = extractToolIO(item);
+    let output = rawOutput;
+    if (!output) {
+      output = pickFirst(item?.error?.message, item?.error, item?.error_message, item?.errorMessage);
+    }
+    const inputLang = item?.type === 'command_execution' ? 'bash' : typeof input === 'object' ? 'json' : 'text';
+    const inputBlock = formatValueForMarkdown(input, { limit: LOG_TOOL_IO_CHAR_LIMIT, forceCodeBlock: true, codeLang: inputLang });
+    const outputBlock = formatValueForMarkdown(output, { limit: LOG_TOOL_IO_CHAR_LIMIT });
+
+    const line = [time ? `[${time}]` : '', `tool ${name}`, statusText].filter(Boolean).join(' ');
+    const cost = inputBlock.preview.length + outputBlock.preview.length + line.length + 1;
+    return {
+      kind: 'tool',
+      time,
+      title: '工具',
+      tool: { name, status: statusText, input: inputBlock, output: outputBlock },
+      line,
+      cost,
+    };
+  };
+
+  const buildLogEntry = (evt) => {
+    if (isLineItem(evt)) {
+      const time = evt?.ts ? formatTime(evt.ts) : '';
+      return buildMetaEntry(time, getLineText(evt));
+    }
+    if (!evt || typeof evt !== 'object') return null;
+    const time = formatTime(evt?.ts || new Date().toISOString());
+
+    if (evt?.source === 'system') {
+      if (evt.kind === 'error') return buildMessageEntry(time, evt?.error?.message || evt.message || '', { kind: 'error', title: '错误' });
+      if (evt.kind === 'warning') return buildMessageEntry(time, evt.message || evt.warning || '', { kind: 'warning', title: '警告' });
+      if (evt.kind === 'status') {
+        const status = String(evt.status || '');
+        if (status === 'failed' || status === 'aborted') {
+          return buildMessageEntry(time, `status ${status}`, { kind: 'warning', title: '状态' });
+        }
+      }
+      return null;
+    }
+
+    if (evt?.source === 'stderr') {
+      if (!shouldSurfaceStderr(evt.text)) return null;
+      return buildMessageEntry(time, String(evt.text || '').trimEnd(), { kind: 'error', title: 'stderr' });
+    }
+
+    if (evt?.source === 'raw') return null;
+
+    if (evt?.source === 'codex') {
+      const e = evt.event || {};
+      if (e.type === 'turn.failed') return buildMessageEntry(time, e?.error?.message || '', { kind: 'error', title: '错误' });
+      if (e.type === 'error') return buildMessageEntry(time, e.message || '', { kind: 'error', title: '错误' });
+      if (e.type === 'item.completed') {
+        const item = e.item || {};
+        const itemType = String(item.type || '');
+        if (itemType === 'reasoning' || itemType === 'todo_list') return null;
+        if (MESSAGE_ITEM_TYPES.has(itemType)) {
+          const text = pickFirst(item.text, item.message, item.output_text, item.content);
+          if (!text) return null;
+          return buildMessageEntry(time, text, { kind: 'message', title: '助手' });
+        }
+        if (itemType === 'error') {
+          const text = pickFirst(item.message, item.text);
+          return buildMessageEntry(time, text || '', { kind: 'error', title: '错误' });
+        }
+        if (TOOL_ITEM_TYPES.has(itemType)) return buildToolEntry(time, item);
+      }
+    }
+
+    return null;
+  };
+
+  const renderToolBlock = (title, block) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'codex-log-tool-block';
+    const label = document.createElement('div');
+    label.className = 'codex-log-tool-title';
+    label.textContent = title;
+    wrap.appendChild(label);
+
+    if (!block?.markdown) {
+      const empty = document.createElement('div');
+      empty.className = 'codex-log-meta-text';
+      empty.textContent = '无';
+      wrap.appendChild(empty);
+      return wrap;
+    }
+
+    const body = document.createElement('div');
+    body.className = 'codex-log-markdown';
+    body.appendChild(renderMarkdown(block.markdown));
+    wrap.appendChild(body);
+    return wrap;
+  };
+
+  const renderLogEntry = (entry) => {
+    const card = document.createElement('div');
+    card.className = 'codex-log-entry';
+    if (entry.kind === 'error') card.classList.add('codex-log-entry--error');
+    if (entry.kind === 'warning') card.classList.add('codex-log-entry--warning');
+
+    const meta = document.createElement('div');
+    meta.className = 'codex-log-meta';
+    if (entry.time) {
+      const time = document.createElement('span');
+      time.className = 'codex-log-time';
+      time.textContent = entry.time;
+      meta.appendChild(time);
+    }
+    if (entry.title) {
+      const label = document.createElement('strong');
+      label.textContent = entry.title;
+      meta.appendChild(label);
+    }
+    card.appendChild(meta);
+
+    if (entry.kind === 'tool' && entry.tool) {
+      const details = document.createElement('details');
+      details.className = 'codex-log-tool';
+      const summary = document.createElement('summary');
+
+      const tag = mkTag(entry.tool.name, { fg: colors.textStrong, bg: colors.bg, border: colors.accentBorder });
+      summary.appendChild(tag);
+      if (entry.tool.status) {
+        const status = mkBadge(entry.tool.status, { fg: colors.textMuted, bg: 'transparent', border: colors.borderStrong });
+        summary.appendChild(status);
+      }
+
+      details.appendChild(summary);
+      const body = document.createElement('div');
+      body.className = 'codex-log-tool-body';
+      body.appendChild(renderToolBlock('入参', entry.tool.input));
+      body.appendChild(renderToolBlock('出参', entry.tool.output));
+      details.appendChild(body);
+      card.appendChild(details);
+      return card;
+    }
+
+    if (entry.kind === 'meta') {
+      const text = document.createElement('div');
+      text.className = 'codex-log-meta-text';
+      text.textContent = entry.text || '';
+      card.appendChild(text);
+      return card;
+    }
+
+    const body = document.createElement('div');
+    body.className = 'codex-log-markdown';
+    body.appendChild(renderMarkdown(entry.markdown || ''));
+    card.appendChild(body);
+    return card;
+  };
+
+  const countRemainingVisible = (events, endIndex) => {
+    let count = 0;
+    for (let i = endIndex; i >= 0; i--) {
+      const entry = buildLogEntry(events[i]);
+      if (entry) count += 1;
+    }
+    return count;
+  };
+
+  const buildRawLogModel = (events) => {
     const kept = [];
     const lines = [];
     let chars = 0;
     let omitted = 0;
 
     for (let i = events.length - 1; i >= 0; i--) {
-      const evt = events[i];
-      if (isLineItem(evt)) {
-        const line = getLineText(evt);
-        const cost = line.length + 1;
-        if (chars + cost > LOG_RENDER_CHAR_BUDGET) {
-          if (!kept.length) {
-            const keep = Math.max(0, LOG_RENDER_CHAR_BUDGET - 32);
-            const truncatedLine = `${line.slice(0, keep)}…(truncated)`;
-            kept.push({ kind: 'meta', text: truncatedLine });
-            lines.push(truncatedLine);
-          } else {
-            omitted = i + 1;
-          }
-          break;
-        }
-        kept.push({ kind: 'meta', text: line });
-        lines.push(line);
-        chars += cost;
-        continue;
-      }
-
-      const line = formatStoredEvent(evt);
+      const line = formatStoredEvent(events[i]);
       const cost = line.length + 1;
       if (chars + cost > LOG_RENDER_CHAR_BUDGET) {
         if (!kept.length) {
           const keep = Math.max(0, LOG_RENDER_CHAR_BUDGET - 32);
           const truncatedLine = `${line.slice(0, keep)}…(truncated)`;
-          kept.push({ kind: 'meta', text: truncatedLine });
+          kept.push({ kind: 'meta', text: truncatedLine, line: truncatedLine, cost: truncatedLine.length + 1 });
           lines.push(truncatedLine);
         } else {
           omitted = i + 1;
         }
         break;
       }
-      kept.push({ kind: 'event', evt });
+      kept.push({ kind: 'meta', text: line, line, cost });
       lines.push(line);
       chars += cost;
     }
@@ -709,7 +1148,47 @@ export function mount({ container, host, slots }) {
     lines.reverse();
     if (omitted > 0) {
       const msg = `[…省略更早的 ${omitted} 条日志…]`;
-      kept.unshift({ kind: 'meta', text: msg });
+      kept.unshift({ kind: 'meta', text: msg, line: msg, cost: msg.length + 1 });
+      lines.unshift(msg);
+    }
+    return { items: kept, lines };
+  };
+
+  const buildLogModel = (windowId) => {
+    const events = getEvents(windowId);
+    if (!events.length) return { items: [], lines: [] };
+    if (state.rawJson) return buildRawLogModel(events);
+
+    const kept = [];
+    const lines = [];
+    let chars = 0;
+    let omitted = 0;
+
+    for (let i = events.length - 1; i >= 0; i--) {
+      const entry = buildLogEntry(events[i]);
+      if (!entry) continue;
+      const cost = entry.cost + 1;
+      if (chars + cost > LOG_RENDER_CHAR_BUDGET) {
+        if (!kept.length) {
+          const keep = Math.max(0, LOG_RENDER_CHAR_BUDGET - 32);
+          const truncatedLine = `${entry.line.slice(0, keep)}…(truncated)`;
+          kept.push({ kind: 'meta', text: truncatedLine, line: truncatedLine, cost: truncatedLine.length + 1 });
+          lines.push(truncatedLine);
+        } else {
+          omitted = countRemainingVisible(events, i);
+        }
+        break;
+      }
+      kept.push(entry);
+      lines.push(entry.line);
+      chars += cost;
+    }
+
+    kept.reverse();
+    lines.reverse();
+    if (omitted > 0) {
+      const msg = `[…省略更早的 ${omitted} 条日志…]`;
+      kept.unshift({ kind: 'meta', text: msg, line: msg, cost: msg.length + 1 });
       lines.unshift(msg);
     }
     return { items: kept, lines };
@@ -723,9 +1202,35 @@ export function mount({ container, host, slots }) {
 
   const renderLog = () => {
     const windowId = state.selectedWindowId;
-    const { lines } = buildLogModel(windowId);
-    logEl.textContent = lines.length ? `${lines.join('\n')}\n` : '';
-    if (lines.length && state.autoScroll) logEl.scrollTop = logEl.scrollHeight;
+    const { items, lines } = buildLogModel(windowId);
+
+    logEl.textContent = '';
+
+    if (state.rawJson) {
+      const pre = document.createElement('pre');
+      pre.style.margin = '0';
+      pre.style.whiteSpace = 'pre-wrap';
+      pre.style.wordBreak = 'break-word';
+      pre.style.fontFamily =
+        'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      pre.textContent = lines.length ? `${lines.join('\n')}\n` : '暂无日志';
+      logEl.appendChild(pre);
+      if (lines.length && state.autoScroll) logEl.scrollTop = logEl.scrollHeight;
+      return;
+    }
+
+    if (!items.length) {
+      const empty = document.createElement('div');
+      empty.className = 'codex-log-empty';
+      empty.textContent = '暂无日志';
+      logEl.appendChild(empty);
+      return;
+    }
+
+    for (const entry of items) {
+      logEl.appendChild(renderLogEntry(entry));
+    }
+    if (state.autoScroll) logEl.scrollTop = logEl.scrollHeight;
   };
 
   const renderInputHistory = () => {
@@ -1693,7 +2198,7 @@ export function mount({ container, host, slots }) {
   btnCopyLog.style.borderRadius = '999px';
   viewBar.appendChild(btnCopyLog);
 
-  const logEl = el('pre', {
+  const logEl = el('div', {
     border: '0',
     borderRadius: '14px',
     padding: '12px',
@@ -1702,14 +2207,8 @@ export function mount({ container, host, slots }) {
     minHeight: '0',
     minWidth: '0',
     flex: '1',
-    background: colors.logBg,
-    color: colors.textStrong,
-    fontSize: '13px',
-    lineHeight: '1.55',
-    whiteSpace: 'pre-wrap',
-    wordBreak: 'break-word',
-    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
   });
+  logEl.className = 'codex-log';
 
   btnCopyLog.addEventListener('click', async () => {
     const windowId = state.selectedWindowId;
