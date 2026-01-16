@@ -112,13 +112,23 @@ const resolveDataDir = () => {
   return path.join(process.cwd(), '.chatos', 'data', PLUGIN_ID);
 };
 
-const getStateFile = () => {
-  const dataDir = resolveDataDir();
+const resolveDataDirFromMeta = (meta) => {
+  const fromUiApp = normalizeString(meta?.chatos?.uiApp?.dataDir);
+  if (fromUiApp) return fromUiApp;
+  const fromWorkdir = normalizeString(meta?.workdir);
+  if (fromWorkdir) return fromWorkdir;
+  return '';
+};
+
+const resolveDataDirWithMeta = (meta) => resolveDataDirFromMeta(meta) || resolveDataDir();
+
+const getStateFile = (meta) => {
+  const dataDir = resolveDataDirWithMeta(meta);
   return dataDir ? path.join(dataDir, STATE_FILE_NAME) : '';
 };
 
-const getRequestsFile = () => {
-  const dataDir = resolveDataDir();
+const getRequestsFile = (meta) => {
+  const dataDir = resolveDataDirWithMeta(meta);
   return dataDir ? path.join(dataDir, REQUESTS_FILE_NAME) : '';
 };
 
@@ -292,10 +302,11 @@ const clampNumber = (value, min, max) => {
   return Math.min(max, Math.max(min, Math.floor(value)));
 };
 
-const loadState = () => readJsonFile(getStateFile()) || { version: 0, windows: [], windowLogs: {}, windowTasks: {} };
+const loadState = (meta) =>
+  readJsonFile(getStateFile(meta)) || { version: 0, windows: [], windowLogs: {}, windowTasks: {} };
 
-const appendCreateWindowRequest = (entry) => {
-  const requestsFile = getRequestsFile();
+const appendCreateWindowRequest = (entry, meta) => {
+  const requestsFile = getRequestsFile(meta);
   const requests = readJsonFile(requestsFile) || { version: STATE_VERSION, createWindows: [] };
   const list = Array.isArray(requests.createWindows) ? requests.createWindows : [];
   list.push(entry);
@@ -464,7 +475,7 @@ const handleRequest = async (req) => {
     }
 
     if (name === 'codex_app.get_windows') {
-      const state = loadState();
+      const state = loadState(params?._meta);
       const windows = Array.isArray(state?.windows) ? state.windows : [];
       return jsonRpcResult(
         id,
@@ -495,12 +506,15 @@ const handleRequest = async (req) => {
       };
 
       const windowId = makeId();
-      appendCreateWindowRequest({
-        id: windowId,
-        name: normalizeString(args?.name) || '',
-        defaults: defaultsApplied,
-        createdAt: new Date().toISOString(),
-      });
+      appendCreateWindowRequest(
+        {
+          id: windowId,
+          name: normalizeString(args?.name) || '',
+          defaults: defaultsApplied,
+          createdAt: new Date().toISOString(),
+        },
+        params?._meta,
+      );
 
       return jsonRpcResult(
         id,
@@ -519,7 +533,7 @@ const handleRequest = async (req) => {
       const offsetRaw = Number(args?.offset);
       const offset = Number.isFinite(offsetRaw) ? Math.max(0, Math.floor(offsetRaw)) : null;
 
-      const state = loadState();
+      const state = loadState(params?._meta);
       const logsEntry = state?.windowLogs?.[windowId] || { events: [], lines: [], updatedAt: '' };
       const events = Array.isArray(logsEntry.events) ? logsEntry.events : [];
       const rawLines = Array.isArray(logsEntry.lines) ? logsEntry.lines : [];
@@ -551,7 +565,7 @@ const handleRequest = async (req) => {
     if (name === 'codex_app.get_window_tasks') {
       const windowId = normalizeString(args?.windowId);
       if (!windowId) return jsonRpcError(id, -32602, 'windowId is required');
-      const state = loadState();
+      const state = loadState(params?._meta);
       const entry = state?.windowTasks?.[windowId];
       return jsonRpcResult(
         id,

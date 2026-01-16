@@ -102,6 +102,20 @@ export function mount({ container, host, slots }) {
 
   let renderMeta = null;
   let themeUnsub = null;
+  const themedSelects = new Set();
+
+  const applySelectTheme = (select) => {
+    if (!select) return;
+    select.style.colorScheme = activeTheme;
+    select.style.background = colors.bg;
+    select.style.color = colors.textStrong;
+    select.style.borderColor = colors.borderStrong;
+    const options = select.querySelectorAll('option');
+    options.forEach((opt) => {
+      opt.style.background = colors.panel;
+      opt.style.color = colors.textStrong;
+    });
+  };
 
   const applyTheme = (theme) => {
     const nextTheme = normalizeTheme(theme);
@@ -134,6 +148,7 @@ export function mount({ container, host, slots }) {
       root.style.setProperty('--codex-title-glow', palette.titleGlow);
     }
     if (renderMeta) renderMeta(nextTheme);
+    themedSelects.forEach((select) => applySelectTheme(select));
   };
 
   const styleEl = document.createElement('style');
@@ -250,6 +265,8 @@ export function mount({ container, host, slots }) {
       o.textContent = opt.label;
       select.appendChild(o);
     }
+    themedSelects.add(select);
+    applySelectTheme(select);
     return select;
   };
 
