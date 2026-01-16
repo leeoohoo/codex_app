@@ -8,7 +8,8 @@
 - `plugin/apps/codex_app/index.mjs`：**module 入口**（导出 `mount({ container, host, slots })`）
 - `plugin/apps/codex_app/compact.mjs`：**compact 入口**（可选；用于侧边抽屉/分栏场景）
 - `plugin/backend/index.mjs`：**插件后端**（导出 `createUiAppsBackend(ctx)`，通过 `host.backend.invoke()` 调用）
-- `plugin/apps/codex_app/mcp-server.mjs`：应用自带 MCP Server
+- `plugin/apps/codex_app/mcp-server.mjs`：MCP Server 源码（构建产物见 bundle）
+- `plugin/apps/codex_app/mcp-server.bundle.mjs`：MCP Server bundle 产物（ChatOS 实际加载）
 - `plugin/apps/codex_app/mcp-prompt.zh.md` / `.en.md`：MCP Prompt
 
 ## 开发与预览（本地沙箱）
@@ -69,4 +70,10 @@ npm run pack
 
 ## MCP（已启用）
 
-本插件已启用 `ai.mcp` 并提供 `plugin/apps/codex_app/mcp-server.mjs`（stdio）。如果你引入第三方依赖，请先打包成单文件或 vendoring 后再引用，避免 `node_modules` 被导入包排除。
+本插件已启用 `ai.mcp`，ChatOS 入口指向 `plugin/apps/codex_app/mcp-server.bundle.mjs`。源码位于 `plugin/apps/codex_app/mcp-server.mjs`，构建命令：
+
+```bash
+npm run build:mcp
+```
+
+注意：导入插件包时会排除 `node_modules`，所以 MCP server 需要 bundle 成单文件再打包。
