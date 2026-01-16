@@ -303,6 +303,15 @@ const pickPreferredWindow = (windows) => {
   if (withThread) return withThread;
   return windows[0] || null;
 };
+const isRunningStatus = (value) => {
+  const status = normalizeString(value).toLowerCase();
+  return status === 'running' || status === 'aborting';
+};
+const findWindowByThreadId = (windows, threadId) => {
+  const needle = normalizeString(threadId);
+  if (!needle) return null;
+  return Array.isArray(windows) ? windows.find((win) => normalizeString(win?.threadId) === needle) : null;
+};
 
 const runProcess = async ({ command, args, input = '' }) => {
   const MAX_OUT = 160_000;
@@ -555,6 +564,14 @@ const handleRequest = async (req) => {
       const windowTarget = windowId ? windows.find((win) => win?.id === windowId) : null;
       let threadId = typeof args?.threadId === 'string' ? args.threadId : '';
       if (!threadId && windowTarget?.threadId) threadId = String(windowTarget.threadId || '');
+      const windowByThread = threadId ? findWindowByThreadId(windows, threadId) : null;
+      const runningTarget = windowTarget || windowByThread;
+      if (runningTarget && isRunningStatus(runningTarget?.status)) {
+        return jsonRpcError(id, -32000, 'window is running; cannot start a new run in the same window', {
+          windowId: runningTarget?.id || '',
+          status: runningTarget?.status || '',
+        });
+      }
       const options = args?.options && typeof args.options === 'object' ? args.options : {};
       const codexArgs = buildCodexExecArgs({ threadId: threadId || null, options });
 

@@ -893,6 +893,10 @@ export function mount({ container, host, slots }) {
 
   const TOOL_ITEM_TYPES = new Set(['command_execution', 'mcp_tool_call', 'web_search']);
   const MESSAGE_ITEM_TYPES = new Set(['agent_message', 'assistant_message', 'message']);
+  const isRunningStatus = (value) => {
+    const status = String(value || '').toLowerCase();
+    return status === 'running' || status === 'aborting';
+  };
 
   const pickFirst = (...values) => {
     for (const value of values) {
@@ -996,14 +1000,15 @@ export function mount({ container, host, slots }) {
     if (!evt || typeof evt !== 'object') return null;
     const time = formatTime(evt?.ts || new Date().toISOString());
 
-    if (evt?.source === 'system') {
-      if (evt.kind === 'error') return buildMessageEntry(time, evt?.error?.message || evt.message || '', { kind: 'error', title: '错误' });
-      if (evt.kind === 'warning') return buildMessageEntry(time, evt.message || evt.warning || '', { kind: 'warning', title: '警告' });
-      if (evt.kind === 'status') {
-        const status = String(evt.status || '');
-        if (status === 'failed' || status === 'aborted') {
-          return buildMessageEntry(time, `status ${status}`, { kind: 'warning', title: '状态' });
-        }
+      if (evt?.source === 'system') {
+        if (evt.kind === 'error') return buildMessageEntry(time, evt?.error?.message || evt.message || '', { kind: 'error', title: '错误' });
+        if (evt.kind === 'warning') return buildMessageEntry(time, evt.message || evt.warning || '', { kind: 'warning', title: '警告' });
+        if (evt.kind === 'user') return buildMessageEntry(time, evt.message || evt.text || '', { kind: 'message', title: '用户' });
+        if (evt.kind === 'status') {
+          const status = String(evt.status || '');
+          if (status === 'failed' || status === 'aborted') {
+            return buildMessageEntry(time, `status ${status}`, { kind: 'warning', title: '状态' });
+          }
       }
       return null;
     }
@@ -1437,6 +1442,11 @@ export function mount({ container, host, slots }) {
     threadIdValue.textContent = win?.threadId ? String(win.threadId) : 'no thread';
     const status = win ? String(win.status || 'idle') : 'idle';
     statusValue.textContent = status;
+    if (btnRun) {
+      const running = isRunningStatus(status);
+      btnRun.disabled = running;
+      btnRun.title = running ? '该窗口正在运行中' : '';
+    }
     if (status === 'running') {
       statusValue.style.background = 'rgba(245,158,11,0.18)';
       statusValue.style.borderColor = 'rgba(245,158,11,0.45)';
@@ -2629,11 +2639,13 @@ export function mount({ container, host, slots }) {
     if (!windowId || !input) return;
 
     const win = state.windows.find((w) => w.id === windowId);
-    if (win && win.status === 'running') {
+    if (win && isRunningStatus(win.status)) {
       appendEvent(windowId, { ts: new Date().toISOString(), source: 'system', kind: 'error', error: { message: '该窗口正在运行中' } });
       return;
     }
 
+    appendEvent(windowId, { ts: new Date().toISOString(), source: 'system', kind: 'user', message: input });
+    promptInput.value = '';
     await recordWindowInput(windowId, input);
 
     btnRun.disabled = true;
@@ -2671,7 +2683,7 @@ export function mount({ container, host, slots }) {
     } catch (e) {
       appendEvent(windowId, { ts: new Date().toISOString(), source: 'system', kind: 'error', error: { message: e?.message || String(e) } });
     } finally {
-      btnRun.disabled = false;
+      updateSelectedHeader();
     }
   });
 
