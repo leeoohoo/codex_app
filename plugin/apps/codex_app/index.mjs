@@ -400,6 +400,7 @@ export function mount({ container, host, slots }) {
     windowTodos: new Map(), // windowId -> { id, items, updatedAt, eventType }
     windowInputs: new Map(), // windowId -> { ts, text }[]
     inputPages: new Map(), // windowId -> page index
+    inputDrafts: new Map(), // windowId -> draft text
     runCursors: new Map(), // runId -> cursor
     pollTimers: new Map(), // runId -> intervalId
     rawJson: false,
@@ -785,6 +786,25 @@ export function mount({ container, host, slots }) {
   const getInputPage = (windowId) => {
     const id = String(windowId || '');
     return state.inputPages.get(id) || 0;
+  };
+
+  const saveInputDraft = (windowId, value) => {
+    const id = String(windowId || '');
+    if (!id) return;
+    const text = String(value ?? '');
+    if (text) state.inputDrafts.set(id, text);
+    else state.inputDrafts.delete(id);
+  };
+
+  const loadInputDraft = (windowId) => {
+    const id = String(windowId || '');
+    if (!id) return '';
+    return String(state.inputDrafts.get(id) || '');
+  };
+
+  const applyInputDraft = (windowId) => {
+    if (!promptInput) return;
+    promptInput.value = loadInputDraft(windowId);
   };
 
   const normalizeTodoItem = (item) => {
@@ -1602,11 +1622,15 @@ export function mount({ container, host, slots }) {
   };
 
   const setSelectedWindow = (windowId) => {
+    if (promptInput && state.selectedWindowId && state.windows.some((w) => w.id === state.selectedWindowId)) {
+      saveInputDraft(state.selectedWindowId, promptInput.value);
+    }
     state.selectedWindowId = String(windowId || '');
     renderWindowList();
     updateSelectedHeader();
     const settings = ensureWindowRunSettings(state.selectedWindowId);
     applyRunSettingsToControls(settings);
+    applyInputDraft(state.selectedWindowId);
     renderInputHistory();
     renderSideTasks();
     loadWindowLogs(state.selectedWindowId).catch((e) =>
@@ -1707,6 +1731,7 @@ export function mount({ container, host, slots }) {
           state.windowTodos.delete(win.id);
           state.windowInputs.delete(win.id);
           state.inputPages.delete(win.id);
+          state.inputDrafts.delete(win.id);
           deleteWindowRunSettings(win.id);
           if (state.selectedWindowId === win.id) {
             setSelectedWindow(state.windows[0]?.id || '');
@@ -2327,6 +2352,10 @@ export function mount({ container, host, slots }) {
     compact: true,
   });
   promptBody.appendChild(promptInput);
+  promptInput.addEventListener('input', () => {
+    if (!state.selectedWindowId) return;
+    saveInputDraft(state.selectedWindowId, promptInput.value);
+  });
 
   const controls = el('div', { display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' });
   const btnRun = mkBtn('运行', { variant: 'primary' });
@@ -2598,6 +2627,9 @@ export function mount({ container, host, slots }) {
   };
 
   const refresh = async () => {
+    if (promptInput && state.selectedWindowId) {
+      saveInputDraft(state.selectedWindowId, promptInput.value);
+    }
     try {
       state.env = await invoke('codexGetEnv');
     } catch {
@@ -2643,6 +2675,7 @@ export function mount({ container, host, slots }) {
     }
     renderWindowList();
     updateSelectedHeader();
+    applyInputDraft(state.selectedWindowId);
     await loadWindowLogs(state.selectedWindowId);
     await loadWindowTasks(state.selectedWindowId);
     await loadWindowInputs(state.selectedWindowId);
@@ -2777,6 +2810,7 @@ export function mount({ container, host, slots }) {
 
     appendEvent(windowId, { ts: new Date().toISOString(), source: 'system', kind: 'user', message: input });
     promptInput.value = '';
+    saveInputDraft(windowId, '');
     await recordWindowInput(windowId, input);
 
     btnRun.disabled = true;

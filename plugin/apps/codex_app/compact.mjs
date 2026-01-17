@@ -23,6 +23,7 @@ export function mount({ container, host }) {
     selectedWindowId: '',
     logs: [],
     tasks: [],
+    inputDrafts: new Map(),
   };
 
   const LOG_ITEM_CHAR_LIMIT = 800;
@@ -816,6 +817,25 @@ export function mount({ container, host }) {
   input.style.outline = 'none';
   input.style.color = 'var(--ds-text-primary, var(--codex-compact-text))';
 
+  const saveInputDraft = (windowId, value) => {
+    const id = String(windowId || '');
+    if (!id) return;
+    const text = String(value ?? '');
+    if (text) state.inputDrafts.set(id, text);
+    else state.inputDrafts.delete(id);
+  };
+
+  const loadInputDraft = (windowId) => {
+    const id = String(windowId || '');
+    if (!id) return '';
+    return String(state.inputDrafts.get(id) || '');
+  };
+
+  input.addEventListener('input', () => {
+    if (!state.selectedWindowId) return;
+    saveInputDraft(state.selectedWindowId, input.value);
+  });
+
   const inputActions = document.createElement('div');
   inputActions.style.display = 'flex';
   inputActions.style.justifyContent = 'flex-end';
@@ -1005,6 +1025,9 @@ export function mount({ container, host }) {
   };
 
   const refreshWindows = async () => {
+    if (state.selectedWindowId) {
+      saveInputDraft(state.selectedWindowId, input.value);
+    }
     const res = await invoke('codexListWindows');
     state.windows = Array.isArray(res?.windows) ? res.windows : [];
     if (state.selectedWindowId && !state.windows.some((w) => w.id === state.selectedWindowId)) {
@@ -1019,6 +1042,7 @@ export function mount({ container, host }) {
       }
     }
     renderWindows();
+    input.value = loadInputDraft(state.selectedWindowId);
   };
 
   const refreshAll = async () => {
@@ -1028,7 +1052,11 @@ export function mount({ container, host }) {
   };
 
   windowSelect.addEventListener('change', () => {
+    if (state.selectedWindowId) {
+      saveInputDraft(state.selectedWindowId, input.value);
+    }
     state.selectedWindowId = windowSelect.value;
+    input.value = loadInputDraft(state.selectedWindowId);
     setStatusMeta();
     loadLogs(state.selectedWindowId).catch(() => {});
     loadTasks(state.selectedWindowId).catch(() => {});
@@ -1087,6 +1115,7 @@ export function mount({ container, host }) {
         if (idx >= 0) state.windows[idx] = res.window;
       }
       input.value = '';
+      saveInputDraft(windowId, '');
       await refreshAll();
     } catch (e) {
       state.logs = [`[error] ${e?.message || String(e)}`];
