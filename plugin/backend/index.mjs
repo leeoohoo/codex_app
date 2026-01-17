@@ -708,24 +708,39 @@ export async function createUiAppsBackend(ctx) {
   }
 
   const abortRun = async (run) => {
-    if (!run || run.status !== 'running') return { ok: true };
-    run.status = 'aborting';
+    if (!run || (run.status !== 'running' && run.status !== 'aborting')) return { ok: true };
+    if (run.status !== 'aborting') run.status = 'aborting';
     try {
       run.abortController?.abort();
     } catch {
       // ignore
     }
-    if (process.platform === 'win32' && Number.isFinite(run.childPid) && run.childPid > 0) {
-      try {
-        const killer = spawn('taskkill', ['/pid', String(run.childPid), '/t', '/f'], {
-          windowsHide: true,
-          env: process.env,
-        });
-        killer.once('error', () => {
+    if (Number.isFinite(run.childPid) && run.childPid > 0) {
+      if (process.platform === 'win32') {
+        try {
+          const killer = spawn('taskkill', ['/pid', String(run.childPid), '/t', '/f'], {
+            windowsHide: true,
+            env: process.env,
+          });
+          killer.once('error', () => {
+            // ignore
+          });
+        } catch {
           // ignore
-        });
-      } catch {
-        // ignore
+        }
+      } else {
+        try {
+          process.kill(run.childPid, 'SIGTERM');
+        } catch {
+          // ignore
+        }
+        setTimeout(() => {
+          try {
+            process.kill(run.childPid, 'SIGKILL');
+          } catch {
+            // ignore
+          }
+        }, 1500);
       }
     }
     pushRunEvent(run, { source: 'system', kind: 'status', status: 'aborting' });
