@@ -40,6 +40,7 @@ export function mount({ container, host }) {
     'file_edit',
     'file_create',
     'file_delete',
+    'file_change',
     'copy_path',
     'move_path',
     'delete_path',
@@ -365,6 +366,12 @@ export function mount({ container, host }) {
       return name ? `mcp ${name}` : 'mcp';
     }
     if (type === 'command_execution') return 'command';
+    if (type === 'file_change') {
+      const changes = Array.isArray(item?.changes) ? item.changes : [];
+      if (changes.length === 1 && changes[0]?.path) return `file_change ${changes[0].path}`;
+      if (changes.length > 1) return `file_change ${changes.length} files`;
+      return 'file_change';
+    }
     if (type === 'web_search') return 'web_search';
     const name = pickFirst(item?.tool, item?.tool_name, item?.toolName, item?.name);
     if (name) return String(name);
@@ -389,6 +396,13 @@ export function mount({ container, host }) {
     if (type === 'command_execution') {
       const output = pickFirst(item.aggregated_output, item.output, item.result);
       return { input: pickFirst(item.command), output };
+    }
+    if (type === 'file_change') {
+      const output = pickFirst(item.status, item.result, item.output, item.message);
+      return {
+        input: pickFirst(item.changes, item.diff, item.patch, item.content, item.files, item.file_changes, filePayload),
+        output,
+      };
     }
     if (type === 'web_search') {
       const output = pickFirst(item.result, item.results, item.output);

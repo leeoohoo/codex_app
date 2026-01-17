@@ -41,6 +41,19 @@ const normalizeBoolean = (value) => {
   return Boolean(value);
 };
 
+const resolveTaskkillPath = () => {
+  const root = normalizeString(process.env?.SystemRoot || process.env?.WINDIR);
+  if (root) {
+    const candidate = path.join(root, 'System32', 'taskkill.exe');
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {
+      // ignore
+    }
+  }
+  return 'taskkill';
+};
+
 const normalizeTodoItem = (item) => {
   if (!item) return null;
   if (typeof item === 'string') {
@@ -774,10 +787,21 @@ export async function createUiAppsBackend(ctx) {
     } catch {
       // ignore
     }
+    const win = windows.get(run.windowId);
+    if (win && win.status !== 'aborting') {
+      win.status = 'aborting';
+      win.updatedAt = nowIso();
+      scheduleStateWrite();
+    }
+    try {
+      if (run.child?.kill) run.child.kill();
+    } catch {
+      // ignore
+    }
     if (Number.isFinite(run.childPid) && run.childPid > 0) {
       if (process.platform === 'win32') {
         try {
-          const killer = spawn('taskkill', ['/pid', String(run.childPid), '/t', '/f'], {
+          const killer = spawn(resolveTaskkillPath(), ['/pid', String(run.childPid), '/t', '/f'], {
             windowsHide: true,
             env: process.env,
           });
@@ -821,10 +845,10 @@ export async function createUiAppsBackend(ctx) {
     const startedAt = nowIso();
     const abortController = new AbortController();
 
-    const run = {
-      id: runId,
-      windowId: window.id,
-      status: 'running',
+      const run = {
+        id: runId,
+        windowId: window.id,
+        status: 'running',
       startedAt,
       finishedAt: '',
       events: [],
@@ -836,12 +860,13 @@ export async function createUiAppsBackend(ctx) {
       pluginId: runtimeCtx?.pluginId || ctx?.pluginId || '',
       childPid: 0,
       nextSeq: 0,
-      droppedEvents: 0,
-      todoList: [],
-      todoListId: '',
-      todoListUpdatedAt: '',
-    };
-    runs.set(runId, run);
+        droppedEvents: 0,
+        todoList: [],
+        todoListId: '',
+        todoListUpdatedAt: '',
+        child: null,
+      };
+      runs.set(runId, run);
 
     window.status = 'running';
     window.activeRunId = runId;
@@ -871,13 +896,14 @@ export async function createUiAppsBackend(ctx) {
         ? buildWindowsCommandArgs(codexCommand, codexArgs)
         : { command: codexCommand, args: codexArgs };
 
-    const child = spawn(spawnSpec.command, spawnSpec.args, {
-      env: process.env,
-      signal: abortController.signal,
-      windowsHide: true,
-    });
+      const child = spawn(spawnSpec.command, spawnSpec.args, {
+        env: process.env,
+        signal: abortController.signal,
+        windowsHide: true,
+      });
 
-    run.childPid = child.pid || 0;
+      run.child = child;
+      run.childPid = child.pid || 0;
 
     const spawnEvt = { source: 'system', kind: 'spawn', command: codexCommand, args: codexArgs };
     if (spawnSpec.command !== codexCommand) spawnEvt.wrapper = spawnSpec;
