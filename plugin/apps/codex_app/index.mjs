@@ -787,11 +787,63 @@ export function mount({ container, host, slots }) {
     return state.inputPages.get(id) || 0;
   };
 
-  const normalizeTodoItems = (items) => {
-    if (!Array.isArray(items)) return [];
-    return items
-      .map((it) => (it && typeof it === 'object' ? { text: String(it.text || '').trim(), completed: Boolean(it.completed) } : null))
-      .filter((it) => it && it.text);
+  const normalizeTodoItem = (item) => {
+    if (!item) return null;
+    if (typeof item === 'string') {
+      const text = item.trim();
+      return text ? { text, completed: false } : null;
+    }
+    if (typeof item !== 'object') return null;
+    const text = String(item.text || item.content || item.title || item.name || item.task || item.label || item.value || '').trim();
+    if (!text) return null;
+    const completed = Boolean(item.completed ?? item.done ?? item.checked ?? item.finished ?? item.isDone ?? item.is_done);
+    return { text, completed };
+  };
+
+  const parseTodoMarkdown = (value) => {
+    const text = normalizeText(value).trim();
+    if (!text) return [];
+    const items = [];
+    for (const rawLine of text.split('\n')) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      let match = line.match(/^[-*]\s+\[(x|X| )\]\s+(.*)$/);
+      if (match) {
+        const itemText = String(match[2] || '').trim();
+        if (itemText) items.push({ text: itemText, completed: String(match[1]).toLowerCase() === 'x' });
+        continue;
+      }
+      match = line.match(/^[-*]\s+(.*)$/);
+      if (match) {
+        const itemText = String(match[1] || '').trim();
+        if (itemText) items.push({ text: itemText, completed: false });
+        continue;
+      }
+      match = line.match(/^\d+\.\s+(.*)$/);
+      if (match) {
+        const itemText = String(match[1] || '').trim();
+        if (itemText) items.push({ text: itemText, completed: false });
+      }
+    }
+    return items;
+  };
+
+  const normalizeTodoItems = (value) => {
+    if (Array.isArray(value)) {
+      const mapped = value.map(normalizeTodoItem).filter(Boolean);
+      if (mapped.length) return mapped;
+    }
+    if (typeof value === 'string') return parseTodoMarkdown(value);
+    if (value && typeof value === 'object') {
+      if (Array.isArray(value.items)) {
+        const mapped = value.items.map(normalizeTodoItem).filter(Boolean);
+        return mapped;
+      }
+      const text = value.text || value.content || value.output_text || value.outputText || value.message;
+      const parsed = parseTodoMarkdown(text);
+      if (parsed.length) return parsed;
+    }
+    return [];
   };
 
   const captureTodoFromEvent = (windowId, evt) => {
@@ -799,15 +851,18 @@ export function mount({ container, host, slots }) {
     const e = evt.event;
     if (e?.type !== 'item.started' && e?.type !== 'item.updated' && e?.type !== 'item.completed') return;
     if (e?.item?.type !== 'todo_list') return;
-    const items = normalizeTodoItems(e?.item?.items);
-    state.windowTodos.set(String(windowId || ''), {
-      id: String(e?.item?.id || ''),
-      items,
-      updatedAt: evt?.ts || new Date().toISOString(),
-      eventType: String(e?.type || ''),
-    });
-    if (state.selectedWindowId === String(windowId || '')) {
-      scheduleRenderSideTasks();
+    const hasExplicitList = Array.isArray(e?.item?.items);
+    const items = normalizeTodoItems(hasExplicitList ? e?.item?.items : e?.item);
+    if (items.length || hasExplicitList) {
+      state.windowTodos.set(String(windowId || ''), {
+        id: String(e?.item?.id || ''),
+        items,
+        updatedAt: evt?.ts || new Date().toISOString(),
+        eventType: String(e?.type || ''),
+      });
+      if (state.selectedWindowId === String(windowId || '')) {
+        scheduleRenderSideTasks();
+      }
     }
   };
 
@@ -2438,19 +2493,19 @@ export function mount({ container, host, slots }) {
     if (!id) return;
     const res = await invoke('codexGetWindowTasks', { windowId: id });
     if (!res?.ok) return;
-    const items = normalizeTodoItems(res?.todoList);
-    state.windowTodos.set(id, {
-      id: String(res?.todoListId || ''),
-      items,
-      updatedAt: String(res?.updatedAt || ''),
-      eventType: 'window.snapshot',
-    });
-    const win = state.windows.find((w) => w.id === id);
-    if (win) {
-      win.todoList = Array.isArray(res?.todoList) ? res.todoList : [];
-      win.todoListId = String(res?.todoListId || '');
-      win.todoListUpdatedAt = String(res?.updatedAt || '');
-    }
+      const items = normalizeTodoItems(res?.todoList);
+      state.windowTodos.set(id, {
+        id: String(res?.todoListId || ''),
+        items,
+        updatedAt: String(res?.updatedAt || ''),
+        eventType: 'window.snapshot',
+      });
+      const win = state.windows.find((w) => w.id === id);
+      if (win) {
+        win.todoList = items;
+        win.todoListId = String(res?.todoListId || '');
+        win.todoListUpdatedAt = String(res?.updatedAt || '');
+      }
     if (state.selectedWindowId === id) {
       scheduleRenderSideTasks();
     }
