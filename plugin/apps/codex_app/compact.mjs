@@ -27,8 +27,33 @@ export function mount({ container, host }) {
 
   const LOG_ITEM_CHAR_LIMIT = 800;
   const LOG_TOOL_IO_CHAR_LIMIT = 1200;
-  const TOOL_ITEM_TYPES = new Set(['command_execution', 'mcp_tool_call', 'web_search']);
-  const MESSAGE_ITEM_TYPES = new Set(['agent_message', 'assistant_message', 'message']);
+  const TOOL_ITEM_TYPES = new Set([
+    'command_execution',
+    'mcp_tool_call',
+    'web_search',
+    'tool_call',
+    'tool_result',
+    'apply_patch',
+    'edit_file',
+    'write_file',
+    'file_write',
+    'file_edit',
+    'file_create',
+    'file_delete',
+    'copy_path',
+    'move_path',
+    'delete_path',
+  ]);
+  const MESSAGE_ITEM_TYPES = new Set([
+    'agent_message',
+    'assistant_message',
+    'message',
+    'output_text',
+    'output',
+    'text',
+    'assistant_output',
+    'final',
+  ]);
 
   const formatTime = (ts) => {
     const s = String(ts || '');
@@ -341,12 +366,26 @@ export function mount({ container, host }) {
     }
     if (type === 'command_execution') return 'command';
     if (type === 'web_search') return 'web_search';
+    const name = pickFirst(item?.tool, item?.tool_name, item?.toolName, item?.name);
+    if (name) return String(name);
+    const path = pickFirst(item?.path, item?.file, item?.file_path, item?.filepath);
+    if (path) return `${type || 'file'} ${path}`;
     return type || 'tool';
   };
 
   const extractToolIO = (item) => {
     if (!item || typeof item !== 'object') return { input: '', output: '' };
     const type = String(item?.type || '');
+    const fileInput = {};
+    const filePath = pickFirst(item?.path, item?.file, item?.file_path, item?.filepath);
+    if (filePath) fileInput.path = filePath;
+    if (item?.content) fileInput.content = item.content;
+    if (item?.diff) fileInput.diff = item.diff;
+    if (item?.patch) fileInput.patch = item.patch;
+    if (item?.before) fileInput.before = item.before;
+    if (item?.after) fileInput.after = item.after;
+    if (item?.edits) fileInput.edits = item.edits;
+    const filePayload = Object.keys(fileInput).length ? fileInput : '';
     if (type === 'command_execution') {
       const output = pickFirst(item.aggregated_output, item.output, item.result);
       return { input: pickFirst(item.command), output };
@@ -360,9 +399,29 @@ export function mount({ container, host }) {
       const output = pickFirst(item.output, item.result, item.response, item.tool_output, item.toolOutput, item.data);
       return { input, output };
     }
-    const input = pickFirst(item.input, item.arguments, item.params, item.command);
-    const output = pickFirst(item.output, item.result, item.response, item.aggregated_output);
+    const input = pickFirst(item.input, item.arguments, item.params, item.command, item.patch, item.diff, item.content, filePayload);
+    const output = pickFirst(
+      item.output,
+      item.result,
+      item.response,
+      item.aggregated_output,
+      item.output_text,
+      item.outputText,
+      item.data,
+    );
     return { input, output };
+  };
+
+  const isToolLikeItem = (item) => {
+    if (!item || typeof item !== 'object') return false;
+    const type = String(item.type || '');
+    if (TOOL_ITEM_TYPES.has(type)) return true;
+    const lower = type.toLowerCase();
+    if (!lower) return false;
+    if (lower.includes('tool') || lower.includes('file') || lower.includes('patch') || lower.includes('edit')) return true;
+    if (item.command) return true;
+    if (item.path || item.file || item.file_path || item.filepath) return true;
+    return false;
   };
 
   const buildMessageEntry = (time, text, { kind = 'message', title = '助手' } = {}) => {
@@ -445,7 +504,10 @@ export function mount({ container, host }) {
           if (!text) return null;
           return buildMessageEntry(time, text, { kind: 'message', title: '助手' });
         }
-        if (TOOL_ITEM_TYPES.has(itemType)) return buildToolEntry(time, item);
+        if (TOOL_ITEM_TYPES.has(itemType) || isToolLikeItem(item)) return buildToolEntry(time, item);
+        const fallbackText = pickFirst(item.text, item.message, item.output_text, item.content);
+        if (fallbackText) return buildMessageEntry(time, fallbackText, { kind: 'message', title: '助手' });
+        return buildMetaEntry(time, `item ${itemType} ${JSON.stringify(item).slice(0, 320)}`);
       }
     }
 
