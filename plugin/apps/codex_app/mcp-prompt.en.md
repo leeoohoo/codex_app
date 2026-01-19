@@ -16,9 +16,10 @@ How to send a message (prompt):
 
 - Call `codex_app.codex_exec` with `prompt` (required).
 - Use `threadId` to resume a conversation.
-- Use `options` to control execution (e.g., `model`, `workingDirectory`, `sandboxMode`, `approvalPolicy`).
+- Use `options` to control execution (e.g., `model`, `workingDirectory`, `sandboxMode`, `approvalPolicy`). If `approvalPolicy` is not provided, it defaults to `never` to avoid interactive blocking; if `workingDirectory` is not a git repo and `skipGitRepoCheck` is not explicitly set, it will be auto-enabled.
 - The result includes the command, exit code, stdout/stderr.
-- If no window exists, `codex_app.codex_exec` will enqueue a new window (disable with `ensureWindow:false`).
+- If no window exists, or `workingDirectory` is provided and no matching idle window is found, `codex_app.codex_exec` will enqueue a new window (disable with `ensureWindow:false`).
+- For long-running tasks, prefer `codex_app.exec_async`: get a `jobId`, poll with `codex_app.exec_status`, then fetch results with `codex_app.exec_result`; cancel via `codex_app.exec_cancel`.
 
 Window notes:
 
@@ -37,3 +38,7 @@ Tools (full):
 - `codex_app.create_window`: create a window (defaults for workingDirectory/sandboxMode are applied when omitted)
 - `codex_app.get_window_logs`: get window logs by line count (`limit` / `offset`, defaults to latest tail)
 - `codex_app.get_window_tasks`: get window task list (todo_list)
+- `codex_app.exec_async`: run `codex exec --json` asynchronously (returns `jobId`)
+- `codex_app.exec_status`: check async job status
+- `codex_app.exec_result`: fetch async job result (stdout/stderr)
+- `codex_app.exec_cancel`: cancel async job

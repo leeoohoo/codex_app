@@ -1628,7 +1628,8 @@ export function mount({ container, host, slots }) {
     state.selectedWindowId = String(windowId || '');
     renderWindowList();
     updateSelectedHeader();
-    const settings = ensureWindowRunSettings(state.selectedWindowId);
+    const selectedWin = state.windows.find((win) => win.id === state.selectedWindowId);
+    const settings = ensureWindowRunSettings(state.selectedWindowId, buildWindowSeedSettings(selectedWin));
     applyRunSettingsToControls(settings);
     applyInputDraft(state.selectedWindowId);
     renderInputHistory();
@@ -2151,6 +2152,22 @@ export function mount({ container, host, slots }) {
     return { ...DEFAULT_RUN_SETTINGS, ...saved };
   };
 
+  const mergeRunSettings = (base, override) => {
+    const merged = { ...(base && typeof base === 'object' ? base : {}) };
+    if (!override || typeof override !== 'object') return merged;
+    for (const [key, value] of Object.entries(override)) {
+      if (value === undefined || value === null) continue;
+      if (typeof value === 'string' && value.trim() === '') continue;
+      merged[key] = value;
+    }
+    return merged;
+  };
+
+  const buildWindowSeedSettings = (win, baseSettings) => {
+    const base = baseSettings && typeof baseSettings === 'object' ? baseSettings : getDefaultRunSettings();
+    return mergeRunSettings(base, win?.defaultRunOptions);
+  };
+
   const applyRunSettingsToControls = (settings) => {
     const base = getDefaultRunSettings();
     const next = { ...base, ...(settings || {}) };
@@ -2650,9 +2667,10 @@ export function mount({ container, host, slots }) {
 
     const defaultSettings = getDefaultRunSettings();
     state.windows.forEach((win) => {
-      ensureWindowRunSettings(win?.id, defaultSettings);
+      ensureWindowRunSettings(win?.id, buildWindowSeedSettings(win, defaultSettings));
     });
-    applyRunSettingsToControls(ensureWindowRunSettings(state.selectedWindowId, defaultSettings));
+    const selectedWin = state.windows.find((w) => w.id === state.selectedWindowId);
+    applyRunSettingsToControls(ensureWindowRunSettings(state.selectedWindowId, buildWindowSeedSettings(selectedWin, defaultSettings)));
     const defaultCd = state.env?.sessionRootGitRoot || state.env?.cwdGitRoot || state.env?.sessionRoot || '';
     if (defaultCd && !workingDirInput.value) workingDirInput.value = String(defaultCd);
     if (!skipRepoExplicit) {

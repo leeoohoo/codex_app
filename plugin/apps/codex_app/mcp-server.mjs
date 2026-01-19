@@ -16,10 +16,15 @@ const PLUGIN_ID = 'com.leeoohoo.codex_app';
 const STATE_VERSION = 1;
 const STATE_FILE_NAME = 'codex_app_state.v1.json';
 const REQUESTS_FILE_NAME = 'codex_app_requests.v1.json';
+const JOBS_VERSION = 1;
+const JOBS_FILE_NAME = 'codex_app_jobs.v1.json';
 const DEFAULT_MODEL = 'gpt-5.2';
 const DEFAULT_APPROVAL = 'never';
 const DEFAULT_LOG_LIMIT = 200;
 const MAX_LOG_LIMIT = 1000;
+const JOBS_HEARTBEAT_MS = 5000;
+const MAX_JOB_STDOUT = 160_000;
+const MAX_JOB_STDERR = 60_000;
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(scriptDir, '..', '..', '..');
@@ -28,6 +33,7 @@ const normalizeString = (value) => {
   if (typeof value !== 'string') return '';
   return String(value || '').trim();
 };
+const nowIso = () => new Date().toISOString();
 
 const makeId = () => {
   try {
@@ -99,10 +105,54 @@ const findUpwardsDataDir = (startPath, pluginId) => {
   return '';
 };
 
+const findGitRepoRoot = (startPath) => {
+  const raw = normalizeString(startPath);
+  if (!raw) return '';
+  let current = raw;
+  try {
+    current = path.resolve(raw);
+  } catch {
+    current = raw;
+  }
+  try {
+    const stat = fs.statSync(current);
+    if (stat.isFile()) current = path.dirname(current);
+  } catch {
+    return '';
+  }
+  for (let i = 0; i < 100; i += 1) {
+    try {
+      if (fs.existsSync(path.join(current, '.git'))) return current;
+    } catch {
+      // ignore
+    }
+    const parent = path.dirname(current);
+    if (!parent || parent === current) break;
+    current = parent;
+  }
+  return '';
+};
+
 const resolveDataDirFromStateDir = (stateDir) => {
   const raw = normalizeString(stateDir);
   if (!raw) return '';
   return path.join(raw, 'ui_apps', 'data', PLUGIN_ID);
+};
+
+const looksLikeDataDir = (value) => {
+  const raw = normalizeString(value);
+  if (!raw) return false;
+  let resolved = raw;
+  try {
+    resolved = path.resolve(raw);
+  } catch {
+    resolved = raw;
+  }
+  const normalized = resolved.split(path.sep).join('/');
+  return (
+    normalized.endsWith(`/ui_apps/data/${PLUGIN_ID}`) ||
+    normalized.endsWith(`/.chatos/data/${PLUGIN_ID}`)
+  );
 };
 
 const resolveStateDirFromEnv = () => {
@@ -142,7 +192,7 @@ const resolveDataDirFromMeta = (meta) => {
   const fromStateDir = resolveDataDirFromStateDir(meta?.chatos?.uiApp?.stateDir);
   if (fromStateDir) return fromStateDir;
   const fromWorkdir = normalizeString(meta?.workdir);
-  if (fromWorkdir) return fromWorkdir;
+  if (fromWorkdir && looksLikeDataDir(fromWorkdir)) return fromWorkdir;
   return '';
 };
 
@@ -166,6 +216,11 @@ const getStateFile = (meta) => {
 const getRequestsFile = (meta) => {
   const dataDir = resolveDataDirWithMeta(meta);
   return dataDir ? path.join(dataDir, REQUESTS_FILE_NAME) : '';
+};
+
+const getJobsFile = (meta) => {
+  const dataDir = resolveDataDirWithMeta(meta);
+  return dataDir ? path.join(dataDir, JOBS_FILE_NAME) : '';
 };
 
 const send = (msg) => {
@@ -200,6 +255,21 @@ const buildWindowsCommandArgs = (command, args) => {
   };
 };
 
+const spawnProcess = ({ command, args, input = '' }) => {
+  const spawnSpec =
+    process.platform === 'win32' ? buildWindowsCommandArgs(command, args) : { command, args: Array.isArray(args) ? args : [] };
+  const child = spawn(spawnSpec.command, spawnSpec.args, { windowsHide: true, env: process.env });
+  if (child.stdin) {
+    try {
+      child.stdin.write(String(input || ''));
+      child.stdin.end();
+    } catch {
+      // ignore
+    }
+  }
+  return { child, spawn: spawnSpec };
+};
+
 const buildCodexExecArgs = ({ threadId, options }) => {
   const args = ['exec', '--json'];
 
@@ -226,6 +296,140 @@ const buildCodexExecArgs = ({ threadId, options }) => {
 
   if (threadId) args.push('resume', String(threadId));
   return args;
+};
+
+const jobStores = new Map();
+
+const serializeJob = (job) => ({
+  id: String(job.id || ''),
+  status: String(job.status || ''),
+  startedAt: String(job.startedAt || ''),
+  updatedAt: String(job.updatedAt || ''),
+  finishedAt: String(job.finishedAt || ''),
+  exitCode: job.exitCode ?? null,
+  signal: job.signal ?? '',
+  error: String(job.error || ''),
+  stdout: String(job.stdout || ''),
+  stderr: String(job.stderr || ''),
+  stdoutTruncated: Boolean(job.stdoutTruncated),
+  stderrTruncated: Boolean(job.stderrTruncated),
+  spawn: job.spawn && typeof job.spawn === 'object' ? job.spawn : null,
+  options: job.options && typeof job.options === 'object' ? job.options : null,
+  threadId: String(job.threadId || ''),
+  windowId: String(job.windowId || ''),
+  windowName: String(job.windowName || ''),
+  ensureWindow: job.ensureWindow === undefined ? undefined : Boolean(job.ensureWindow),
+  defaultsApplied: job.defaultsApplied && typeof job.defaultsApplied === 'object' ? job.defaultsApplied : null,
+  lastOutputAt: String(job.lastOutputAt || ''),
+  lastHeartbeatAt: String(job.lastHeartbeatAt || ''),
+});
+
+const getJobStore = (meta) => {
+  const jobsFile = getJobsFile(meta);
+  const key = jobsFile || `cwd:${process.cwd()}`;
+  let store = jobStores.get(key);
+  if (!store) {
+    store = { jobsFile, jobs: new Map(), writeTimer: null, restored: false };
+    jobStores.set(key, store);
+  }
+  if (!store.restored) {
+    store.restored = true;
+    const snapshot = readJsonFile(jobsFile) || {};
+    const list = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
+    for (const entry of list) {
+      if (!entry || typeof entry !== 'object') continue;
+      const job = { ...entry };
+      if (job.status === 'running') {
+        job.status = 'orphaned';
+        job.error = job.error || 'job process not available';
+        job.finishedAt = job.finishedAt || nowIso();
+        job.updatedAt = nowIso();
+      }
+      const id = String(job.id || makeId());
+      job.id = id;
+      store.jobs.set(id, job);
+    }
+  }
+  return store;
+};
+
+const scheduleJobStoreWrite = (store) => {
+  if (!store?.jobsFile) return;
+  if (store.writeTimer) return;
+  store.writeTimer = setTimeout(() => {
+    store.writeTimer = null;
+    const jobs = Array.from(store.jobs.values()).map(serializeJob);
+    writeJsonFileAtomic(store.jobsFile, { version: JOBS_VERSION, updatedAt: nowIso(), jobs });
+  }, 200);
+};
+
+const appendJobOutput = (job, key, chunk) => {
+  const isStdout = key === 'stdout';
+  const maxLen = isStdout ? MAX_JOB_STDOUT : MAX_JOB_STDERR;
+  const truncatedKey = isStdout ? 'stdoutTruncated' : 'stderrTruncated';
+  if (job[truncatedKey]) return;
+  const text = String(chunk?.toString?.('utf8') || chunk || '');
+  if (!text) return;
+  const next = String(job[key] || '') + text;
+  if (next.length > maxLen) {
+    job[key] = `${next.slice(0, maxLen)}\n…(truncated)`;
+    job[truncatedKey] = true;
+  } else {
+    job[key] = next;
+  }
+  job.lastOutputAt = nowIso();
+  job.updatedAt = job.lastOutputAt;
+};
+
+const buildJobSummary = (job) => ({
+  id: String(job.id || ''),
+  status: String(job.status || ''),
+  startedAt: String(job.startedAt || ''),
+  updatedAt: String(job.updatedAt || ''),
+  finishedAt: String(job.finishedAt || ''),
+  exitCode: job.exitCode ?? null,
+  signal: job.signal ?? '',
+  error: String(job.error || ''),
+  threadId: String(job.threadId || ''),
+  windowId: String(job.windowId || ''),
+  lastOutputAt: String(job.lastOutputAt || ''),
+  lastHeartbeatAt: String(job.lastHeartbeatAt || ''),
+});
+
+const buildJobResult = (job) => ({
+  ...buildJobSummary(job),
+  stdout: String(job.stdout || ''),
+  stderr: String(job.stderr || ''),
+  stdoutTruncated: Boolean(job.stdoutTruncated),
+  stderrTruncated: Boolean(job.stderrTruncated),
+  spawn: job.spawn && typeof job.spawn === 'object' ? job.spawn : null,
+  options: job.options && typeof job.options === 'object' ? job.options : null,
+  defaultsApplied: job.defaultsApplied && typeof job.defaultsApplied === 'object' ? job.defaultsApplied : null,
+});
+
+const finishJob = (job, store, { code = null, signal = null, error = '' } = {}) => {
+  if (!job || (job.status !== 'running' && job.status !== 'aborting')) return;
+  job.exitCode = code;
+  job.signal = signal;
+  job.error = error ? String(error) : '';
+  job.finishedAt = nowIso();
+  job.updatedAt = job.finishedAt;
+  if (signal) {
+    job.status = 'aborted';
+  } else if (code === 0) {
+    job.status = 'finished';
+  } else {
+    job.status = 'failed';
+  }
+  if (job.heartbeatTimer) {
+    try {
+      clearInterval(job.heartbeatTimer);
+    } catch {
+      // ignore
+    }
+  }
+  job.heartbeatTimer = null;
+  scheduleJobStoreWrite(store);
 };
 
 const formatCodexItem = (item) => {
@@ -311,6 +515,28 @@ const findWindowByThreadId = (windows, threadId) => {
   const needle = normalizeString(threadId);
   if (!needle) return null;
   return Array.isArray(windows) ? windows.find((win) => normalizeString(win?.threadId) === needle) : null;
+};
+const normalizePath = (value) => {
+  const raw = normalizeString(value);
+  if (!raw) return '';
+  try {
+    return path.resolve(raw);
+  } catch {
+    return raw;
+  }
+};
+const getWindowWorkingDirectory = (win) =>
+  normalizePath(win?.lastRunOptions?.workingDirectory || win?.defaultRunOptions?.workingDirectory || '');
+const findWindowByWorkingDirectory = (windows, workingDirectory, { includeRunning = false } = {}) => {
+  const needle = normalizePath(workingDirectory);
+  if (!needle) return null;
+  return Array.isArray(windows)
+    ? windows.find((win) => {
+        if (!includeRunning && isRunningStatus(win?.status)) return false;
+        const workdir = getWindowWorkingDirectory(win);
+        return workdir && workdir === needle;
+      })
+    : null;
 };
 
 const runProcess = async ({ command, args, input = '' }) => {
@@ -453,6 +679,69 @@ const TOOLS = [
     },
   },
   {
+    name: 'codex_app.exec_async',
+    description: 'Run `codex exec --json` asynchronously and return a jobId for polling.',
+    inputSchema: {
+      type: 'object',
+      required: ['prompt'],
+      properties: {
+        prompt: { type: 'string', description: 'Prompt passed to codex via stdin.' },
+        threadId: { type: 'string', description: 'Optional thread id to resume.' },
+        windowId: { type: 'string', description: 'Optional. If set, use this window when creating a new UI window.' },
+        ensureWindow: { type: 'boolean', description: 'Optional. When no window exists, create one and attach this run.' },
+        windowName: { type: 'string', description: 'Optional. Name used if a new window is created.' },
+        codexCommand: { type: 'string', description: 'Executable name or path (default: codex).' },
+        options: {
+          type: 'object',
+          properties: {
+            model: { type: 'string' },
+            modelReasoningEffort: { type: 'string' },
+            workingDirectory: { type: 'string' },
+            sandboxMode: { type: 'string' },
+            approvalPolicy: { type: 'string' },
+            experimentalWindowsSandboxEnabled: { type: 'boolean' },
+            networkAccessEnabled: { type: 'boolean' },
+            webSearchEnabled: { type: 'boolean' },
+            skipGitRepoCheck: { type: 'boolean' },
+          },
+        },
+      },
+    },
+  },
+  {
+    name: 'codex_app.exec_status',
+    description: 'Get async exec job status.',
+    inputSchema: {
+      type: 'object',
+      required: ['jobId'],
+      properties: {
+        jobId: { type: 'string' },
+      },
+    },
+  },
+  {
+    name: 'codex_app.exec_result',
+    description: 'Get async exec job result (stdout/stderr).',
+    inputSchema: {
+      type: 'object',
+      required: ['jobId'],
+      properties: {
+        jobId: { type: 'string' },
+      },
+    },
+  },
+  {
+    name: 'codex_app.exec_cancel',
+    description: 'Cancel an async exec job.',
+    inputSchema: {
+      type: 'object',
+      required: ['jobId'],
+      properties: {
+        jobId: { type: 'string' },
+      },
+    },
+  },
+  {
     name: 'codex_app.get_windows',
     description: 'List windows with last/default run settings (model, reasoning, working dir, sandbox, etc).',
     inputSchema: { type: 'object', properties: {} },
@@ -572,12 +861,25 @@ const handleRequest = async (req) => {
           status: runningTarget?.status || '',
         });
       }
-      const options = args?.options && typeof args.options === 'object' ? args.options : {};
+      const options = args?.options && typeof args.options === 'object' ? { ...args.options } : {};
+      if (!normalizeString(options.approvalPolicy)) {
+        options.approvalPolicy = DEFAULT_APPROVAL;
+      }
+      if (options.skipGitRepoCheck === undefined) {
+        const workdirForCheck = normalizeString(options.workingDirectory);
+        if (workdirForCheck && !findGitRepoRoot(workdirForCheck)) {
+          options.skipGitRepoCheck = true;
+        }
+      }
+      const requestedWorkdir = normalizeString(options?.workingDirectory);
+      const canMatchWorkdir = !windowId && !threadId && Boolean(requestedWorkdir);
+      const windowByWorkdir = canMatchWorkdir ? findWindowByWorkingDirectory(windows, requestedWorkdir) : null;
       const codexArgs = buildCodexExecArgs({ threadId: threadId || null, options });
 
       const res = await runProcess({ command: codexCommand, args: codexArgs, input: prompt });
       const ensureWindow = args?.ensureWindow === undefined ? true : Boolean(args.ensureWindow);
-      const shouldCreateWindow = ensureWindow && (!windows.length || (windowId && !windowTarget));
+      const shouldCreateWindow =
+        ensureWindow && (!windows.length || (windowId && !windowTarget) || (canMatchWorkdir && !windowByWorkdir));
       let createdWindowId = '';
       if (shouldCreateWindow) {
         const derivedId = windowId || makeId();
@@ -605,6 +907,188 @@ const handleRequest = async (req) => {
         .filter(Boolean)
         .join('\n');
       return jsonRpcResult(id, toolResultText(text));
+    }
+
+    if (name === 'codex_app.exec_async') {
+      const prompt = typeof args?.prompt === 'string' ? args.prompt : '';
+      if (!String(prompt || '').trim()) return jsonRpcError(id, -32602, 'prompt is required');
+
+      const codexCommand = String(args?.codexCommand || 'codex').trim() || 'codex';
+      const state = loadState(params?._meta);
+      const windows = sortWindowsByRecent(Array.isArray(state?.windows) ? state.windows : []);
+      const windowId = normalizeString(args?.windowId);
+      const windowTarget = windowId ? windows.find((win) => win?.id === windowId) : null;
+      let threadId = typeof args?.threadId === 'string' ? args.threadId : '';
+      if (!threadId && windowTarget?.threadId) threadId = String(windowTarget.threadId || '');
+      const windowByThread = threadId ? findWindowByThreadId(windows, threadId) : null;
+      const runningTarget = windowTarget || windowByThread;
+      if (runningTarget && isRunningStatus(runningTarget?.status)) {
+        return jsonRpcError(id, -32000, 'window is running; cannot start a new run in the same window', {
+          windowId: runningTarget?.id || '',
+          status: runningTarget?.status || '',
+        });
+      }
+      const options = args?.options && typeof args.options === 'object' ? { ...args.options } : {};
+      if (!normalizeString(options.approvalPolicy)) {
+        options.approvalPolicy = DEFAULT_APPROVAL;
+      }
+      if (options.skipGitRepoCheck === undefined) {
+        const workdirForCheck = normalizeString(options.workingDirectory);
+        if (workdirForCheck && !findGitRepoRoot(workdirForCheck)) {
+          options.skipGitRepoCheck = true;
+        }
+      }
+      const requestedWorkdir = normalizeString(options?.workingDirectory);
+      const canMatchWorkdir = !windowId && !threadId && Boolean(requestedWorkdir);
+      const windowByWorkdir = canMatchWorkdir ? findWindowByWorkingDirectory(windows, requestedWorkdir) : null;
+      const codexArgs = buildCodexExecArgs({ threadId: threadId || null, options });
+
+      const ensureWindow = args?.ensureWindow === undefined ? true : Boolean(args.ensureWindow);
+      const shouldCreateWindow =
+        ensureWindow && (!windows.length || (windowId && !windowTarget) || (canMatchWorkdir && !windowByWorkdir));
+      const windowName = normalizeString(args?.windowName) || '';
+      let createdWindowId = '';
+      let defaultsApplied = null;
+      if (shouldCreateWindow) {
+        createdWindowId = windowId || makeId();
+        defaultsApplied = buildDefaultsApplied(options, params?._meta);
+        appendCreateWindowRequest(
+          {
+            id: createdWindowId,
+            name: windowName,
+            defaults: defaultsApplied,
+            createdAt: nowIso(),
+          },
+          params?._meta,
+        );
+      }
+
+      const { child, spawn } = spawnProcess({ command: codexCommand, args: codexArgs, input: prompt });
+      const store = getJobStore(params?._meta);
+      const jobId = makeId();
+      const job = {
+        id: jobId,
+        status: 'running',
+        startedAt: nowIso(),
+        updatedAt: nowIso(),
+        finishedAt: '',
+        exitCode: null,
+        signal: null,
+        error: '',
+        stdout: '',
+        stderr: '',
+        stdoutTruncated: false,
+        stderrTruncated: false,
+        spawn,
+        options,
+        threadId: threadId || '',
+        windowId: createdWindowId || windowId || windowTarget?.id || '',
+        windowName,
+        ensureWindow,
+        defaultsApplied,
+        lastOutputAt: '',
+        lastHeartbeatAt: nowIso(),
+        child,
+        heartbeatTimer: null,
+      };
+      store.jobs.set(jobId, job);
+      scheduleJobStoreWrite(store);
+
+      job.heartbeatTimer = setInterval(() => {
+        if (job.status !== 'running' && job.status !== 'aborting') return;
+        job.lastHeartbeatAt = nowIso();
+        job.updatedAt = job.lastHeartbeatAt;
+        scheduleJobStoreWrite(store);
+      }, JOBS_HEARTBEAT_MS);
+
+      child.stdout?.on('data', (chunk) => {
+        appendJobOutput(job, 'stdout', chunk);
+        scheduleJobStoreWrite(store);
+      });
+      child.stderr?.on('data', (chunk) => {
+        appendJobOutput(job, 'stderr', chunk);
+        scheduleJobStoreWrite(store);
+      });
+
+      let finished = false;
+      const finalize = (code, signal, error) => {
+        if (finished) return;
+        finished = true;
+        const threadIdFromOutput = parseThreadIdFromStdout(job.stdout) || '';
+        if (threadIdFromOutput) job.threadId = threadIdFromOutput;
+        if (threadIdFromOutput && createdWindowId && defaultsApplied) {
+          appendCreateWindowRequest(
+            {
+              id: createdWindowId,
+              name: windowName,
+              defaults: defaultsApplied,
+              threadId: threadIdFromOutput,
+              createdAt: nowIso(),
+            },
+            params?._meta,
+          );
+        }
+        finishJob(job, store, { code, signal, error });
+      };
+
+      child.once('error', (err) => finalize(null, null, err?.message || String(err)));
+      child.once('close', (code, signal) => finalize(code, signal, ''));
+
+      return jsonRpcResult(
+        id,
+        toolResultJson({
+          ok: true,
+          jobId,
+          status: job.status,
+          startedAt: job.startedAt,
+          windowId: createdWindowId || '',
+          note: createdWindowId ? `window: created ${createdWindowId} (pending UI refresh)` : '',
+        }),
+      );
+    }
+
+    if (name === 'codex_app.exec_status') {
+      const jobId = normalizeString(args?.jobId);
+      if (!jobId) return jsonRpcError(id, -32602, 'jobId is required');
+      const store = getJobStore(params?._meta);
+      const job = store.jobs.get(jobId);
+      if (!job) return jsonRpcError(id, -32602, `job not found: ${jobId}`);
+      return jsonRpcResult(id, toolResultJson({ ok: true, job: buildJobSummary(job) }));
+    }
+
+    if (name === 'codex_app.exec_result') {
+      const jobId = normalizeString(args?.jobId);
+      if (!jobId) return jsonRpcError(id, -32602, 'jobId is required');
+      const store = getJobStore(params?._meta);
+      const job = store.jobs.get(jobId);
+      if (!job) return jsonRpcError(id, -32602, `job not found: ${jobId}`);
+      if (job.status === 'running' || job.status === 'aborting') {
+        return jsonRpcError(id, -32000, 'job is still running', buildJobSummary(job));
+      }
+      return jsonRpcResult(id, toolResultJson({ ok: true, job: buildJobResult(job) }));
+    }
+
+    if (name === 'codex_app.exec_cancel') {
+      const jobId = normalizeString(args?.jobId);
+      if (!jobId) return jsonRpcError(id, -32602, 'jobId is required');
+      const store = getJobStore(params?._meta);
+      const job = store.jobs.get(jobId);
+      if (!job) return jsonRpcError(id, -32602, `job not found: ${jobId}`);
+      if (job.status !== 'running' && job.status !== 'aborting') {
+        return jsonRpcResult(id, toolResultJson({ ok: true, job: buildJobSummary(job) }));
+      }
+      if (job.status !== 'aborting') {
+        job.status = 'aborting';
+        job.updatedAt = nowIso();
+        job.lastHeartbeatAt = job.updatedAt;
+        scheduleJobStoreWrite(store);
+      }
+      try {
+        if (job.child?.kill) job.child.kill();
+      } catch {
+        // ignore
+      }
+      return jsonRpcResult(id, toolResultJson({ ok: true, job: buildJobSummary(job) }));
     }
 
     if (name === 'codex_app.get_windows') {

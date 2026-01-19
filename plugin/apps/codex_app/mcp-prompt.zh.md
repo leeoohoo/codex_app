@@ -16,9 +16,10 @@
 
 - 使用 `codex_app.codex_exec`，把用户消息放到 `prompt` 字段（必填）。
 - 如需续接会话，传 `threadId`。
-- 需要控制执行参数时，使用 `options`（如 `model`、`workingDirectory`、`sandboxMode`、`approvalPolicy` 等）。
+- 需要控制执行参数时，使用 `options`（如 `model`、`workingDirectory`、`sandboxMode`、`approvalPolicy` 等）。若未显式提供 `approvalPolicy`，默认使用 `never` 避免交互阻塞；若 `workingDirectory` 不是 git 仓库且未显式设置 `skipGitRepoCheck`，将自动跳过 git 检查。
 - 返回内容包含命令、退出码、stdout/stderr。
-- 当没有可用窗口时，`codex_app.codex_exec` 会自动创建一个新窗口（可用 `ensureWindow:false` 关闭）。
+- 当没有可用窗口，或提供了 `workingDirectory` 且找不到匹配的空闲窗口时，`codex_app.codex_exec` 会自动创建一个新窗口（可用 `ensureWindow:false` 关闭）。
+- 长任务建议改用 `codex_app.exec_async`：先拿到 `jobId`，再用 `codex_app.exec_status` 轮询状态，完成后用 `codex_app.exec_result` 取结果；需要中止可用 `codex_app.exec_cancel`。
 
 窗口相关说明：
 
@@ -37,3 +38,7 @@
 - `codex_app.create_window`：新建窗口（可省略 `workingDirectory` / `sandboxMode`；默认值会在返回中明确）
 - `codex_app.get_window_logs`：按行数获取窗口日志（支持 `limit` / `offset`，默认返回最新尾部）
 - `codex_app.get_window_tasks`：获取窗口任务列表（todo_list）
+- `codex_app.exec_async`：异步执行 `codex exec --json`（返回 `jobId`）
+- `codex_app.exec_status`：查询异步任务状态
+- `codex_app.exec_result`：获取异步任务结果（stdout/stderr）
+- `codex_app.exec_cancel`：取消异步任务
