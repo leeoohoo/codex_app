@@ -277,6 +277,8 @@ export function mount({ container, host, slots }) {
   let sideInputsNextBtn = null;
   let sideTasksSummaryEl = null;
   let sideTasksListEl = null;
+  let taskListSummaryEl = null;
+  const mcpTaskGroupOpen = new Map();
 
   const getWindowInputs = (windowId) => {
     const id = String(windowId || '');
@@ -1223,67 +1225,173 @@ export function mount({ container, host, slots }) {
     return '待执行';
   };
 
-  const renderTaskList = () => {
-    taskList.textContent = '';
+  const groupMcpTasksByWorkdir = (tasks) => {
+    const groups = [];
+    const map = new Map();
+    for (const task of tasks) {
+      const workdir = String(task?.workingDirectory || '').trim() || '未指定目录';
+      let group = map.get(workdir);
+      if (!group) {
+        group = { workdir, items: [] };
+        map.set(workdir, group);
+        groups.push(group);
+      }
+      group.items.push(task);
+    }
+    return groups;
+  };
+
+  const deleteMcpTask = async (task) => {
+    const id = String(task?.id || '');
+    if (!id) return;
+    try {
+      const res = await invoke('codexDeleteMcpTask', { taskId: id });
+      if (!res?.ok) return;
+      state.mcpTasks = state.mcpTasks.filter((item) => String(item?.id || '') !== id);
+      renderMcpTaskList();
+    } catch (e) {
+      appendEvent(state.selectedWindowId, {
+        ts: new Date().toISOString(),
+        source: 'system',
+        kind: 'error',
+        error: { message: e?.message || String(e) },
+      });
+    }
+  };
+
+  const buildMcpTaskRow = (task, { compact = false } = {}) => {
+    const row = el('div', {
+      display: 'grid',
+      gap: compact ? '4px' : '6px',
+      padding: compact ? '8px' : '10px',
+      borderRadius: '12px',
+      border: `1px solid ${colors.border}`,
+      background: colors.bg,
+    });
+
+    const input = String(task?.input || '').trim();
+    row.title = input;
+
+    const title = el('div', {
+      fontWeight: '700',
+      color: colors.textStrong,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+      fontSize: compact ? '12px' : '',
+    });
+    title.textContent = input ? input.slice(0, compact ? 28 : 36) : task?.id || 'MCP 任务';
+    title.title = input;
+
+    const meta = el('div', {
+      fontSize: compact ? '11px' : '12px',
+      color: colors.textMuted,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+    });
+    const time = formatTaskTime(task?.createdAt);
+    const winLabel = task?.windowName || task?.windowId || '';
+    meta.textContent = [time, winLabel].filter(Boolean).join(' · ');
+
+    const statusRow = el('div', { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' });
+    const statusLabel = getTaskStatusLabel(task);
+    const statusBadge = mkBadge(statusLabel, {
+      fg: statusLabel === '执行中' ? '#f59e0b' : statusLabel === '完成' ? '#22c55e' : statusLabel === '失败' ? '#ef4444' : colors.textMuted,
+      bg: statusLabel === '执行中' ? 'rgba(245,158,11,0.12)' : statusLabel === '完成' ? 'rgba(34,197,94,0.12)' : statusLabel === '失败' ? 'rgba(239,68,68,0.12)' : 'transparent',
+      border: statusLabel === '执行中' ? 'rgba(245,158,11,0.35)' : statusLabel === '完成' ? 'rgba(34,197,94,0.35)' : statusLabel === '失败' ? 'rgba(239,68,68,0.35)' : colors.borderStrong,
+    });
+    statusRow.appendChild(statusBadge);
+
+    const canDelete = String(task?.status || '').toLowerCase() !== 'running';
+    if (canDelete) {
+      const btnDelete = mkBtn('删除', { variant: 'danger' });
+      btnDelete.style.padding = compact ? '4px 6px' : '6px 8px';
+      btnDelete.style.borderRadius = '10px';
+      btnDelete.style.fontSize = compact ? '11px' : '12px';
+      btnDelete.style.fontWeight = '650';
+      btnDelete.addEventListener('click', (e) => {
+        e.stopPropagation();
+        deleteMcpTask(task);
+      });
+      statusRow.appendChild(btnDelete);
+    }
+
+    row.appendChild(title);
+    row.appendChild(meta);
+    row.appendChild(statusRow);
+    return row;
+  };
+
+  const buildMcpTaskGroup = (group, { compact = false } = {}) => {
+    const details = document.createElement('details');
+    const storedOpen = mcpTaskGroupOpen.get(group.workdir);
+    details.open = storedOpen === undefined ? true : storedOpen;
+    details.style.border = `1px solid ${colors.border}`;
+    details.style.borderRadius = '12px';
+    details.style.background = colors.panelHover;
+    details.style.padding = compact ? '6px' : '8px';
+    details.addEventListener('toggle', () => {
+      mcpTaskGroupOpen.set(group.workdir, details.open);
+    });
+
+    const summary = document.createElement('summary');
+    summary.style.cursor = 'pointer';
+    summary.style.listStyle = 'none';
+    summary.style.display = 'flex';
+    summary.style.alignItems = 'center';
+    summary.style.justifyContent = 'space-between';
+    summary.style.gap = '8px';
+    summary.style.padding = compact ? '2px 2px' : '4px 2px';
+
+    const summaryTitle = el('div', {
+      fontSize: compact ? '11px' : '12px',
+      fontWeight: '700',
+      color: colors.textStrong,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+      flex: '1',
+    });
+    summaryTitle.textContent = group.workdir;
+    summaryTitle.title = group.workdir;
+
+    const summaryBadge = mkBadge(String(group.items.length), { fg: colors.textMuted, border: colors.borderStrong });
+
+    summary.appendChild(summaryTitle);
+    summary.appendChild(summaryBadge);
+
+    const body = el('div', { display: 'flex', flexDirection: 'column', gap: compact ? '6px' : '8px', marginTop: '6px' });
+    for (const task of group.items) {
+      body.appendChild(buildMcpTaskRow(task, { compact }));
+    }
+
+    details.appendChild(summary);
+    details.appendChild(body);
+    return details;
+  };
+
+  const renderMcpTasksTo = ({ listEl, summaryEl, compact = false }) => {
+    if (!listEl || !summaryEl) return;
+    listEl.textContent = '';
     const tasks = Array.isArray(state.mcpTasks) ? state.mcpTasks : [];
     if (!tasks.length) {
+      summaryEl.textContent = '暂无 MCP 任务';
       const empty = el('div', { fontSize: '12px', color: colors.textMuted, padding: '6px 2px' });
       empty.textContent = '暂无 MCP 任务';
-      taskList.appendChild(empty);
+      listEl.appendChild(empty);
       return;
     }
 
-    for (const task of tasks) {
-      const row = el('div', {
-        display: 'grid',
-        gap: '6px',
-        padding: '10px',
-        borderRadius: '12px',
-        border: `1px solid ${colors.border}`,
-        background: colors.bg,
-      });
-
-      const title = el('div', {
-        fontWeight: '700',
-        color: colors.textStrong,
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
-        whiteSpace: 'nowrap',
-      });
-      const input = String(task?.input || '').trim();
-      title.textContent = input ? input.slice(0, 36) : task?.id || 'MCP 任务';
-
-      const meta = el('div', {
-        fontSize: '12px',
-        color: colors.textMuted,
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
-        whiteSpace: 'nowrap',
-      });
-      const workdir = String(task?.workingDirectory || '').trim();
-      const time = formatTaskTime(task?.createdAt);
-      meta.textContent = [workdir || '未指定目录', time].filter(Boolean).join(' · ');
-
-      const statusRow = el('div', { display: 'flex', alignItems: 'center', gap: '6px' });
-      const statusLabel = getTaskStatusLabel(task);
-      const statusBadge = mkBadge(statusLabel, {
-        fg: statusLabel === '执行中' ? '#f59e0b' : statusLabel === '完成' ? '#22c55e' : statusLabel === '失败' ? '#ef4444' : colors.textMuted,
-        bg: statusLabel === '执行中' ? 'rgba(245,158,11,0.12)' : statusLabel === '完成' ? 'rgba(34,197,94,0.12)' : statusLabel === '失败' ? 'rgba(239,68,68,0.12)' : 'transparent',
-        border: statusLabel === '执行中' ? 'rgba(245,158,11,0.35)' : statusLabel === '完成' ? 'rgba(34,197,94,0.35)' : statusLabel === '失败' ? 'rgba(239,68,68,0.35)' : colors.borderStrong,
-      });
-      statusRow.appendChild(statusBadge);
-
-      if (task?.windowName || task?.windowId) {
-        const winLabel = el('div', { fontSize: '12px', color: colors.textMuted });
-        winLabel.textContent = task.windowName || task.windowId;
-        statusRow.appendChild(winLabel);
-      }
-
-      row.appendChild(title);
-      row.appendChild(meta);
-      row.appendChild(statusRow);
-      taskList.appendChild(row);
+    summaryEl.textContent = `共 ${tasks.length} 条`;
+    const groups = groupMcpTasksByWorkdir(tasks);
+    for (const group of groups) {
+      listEl.appendChild(buildMcpTaskGroup(group, { compact }));
     }
+  };
+
+  const renderMcpTaskList = () => {
+    renderMcpTasksTo({ listEl: taskList, summaryEl: taskListSummaryEl, compact: false });
   };
 
   const stopPolling = (runId) => {
@@ -1460,7 +1568,8 @@ export function mount({ container, host, slots }) {
   const sidebarDivider = el('div', { height: '1px', background: colors.border });
 
   const taskListHint = el('div', { fontSize: '12px', color: colors.textMuted });
-  taskListHint.textContent = 'MCP 任务列表（同目录串行）';
+  taskListHint.textContent = 'MCP 任务列表（同目录可折叠，悬浮查看 prompt）';
+  taskListSummaryEl = el('div', { fontSize: '12px', color: colors.textMuted });
 
   const taskList = el('div', {
     display: 'flex',
@@ -1475,6 +1584,7 @@ export function mount({ container, host, slots }) {
   sidebar.appendChild(windowList);
   sidebar.appendChild(sidebarDivider);
   sidebar.appendChild(taskListHint);
+  sidebar.appendChild(taskListSummaryEl);
   sidebar.appendChild(taskList);
 
   const main = el('div', {
@@ -2120,6 +2230,7 @@ export function mount({ container, host, slots }) {
   rightPanel.appendChild(sideTasksGroup);
   renderInputHistory();
   renderSideTasks();
+  renderMcpTaskList();
 
   body.appendChild(sidebar);
   body.appendChild(main);
@@ -2259,9 +2370,32 @@ export function mount({ container, host, slots }) {
       const res = await invoke('codexListMcpTasks');
       if (!res?.ok) return;
       state.mcpTasks = Array.isArray(res?.tasks) ? res.tasks : [];
-      renderTaskList();
+      renderMcpTaskList();
       await maybeSendMcpPrompts(state.mcpTasks);
+      refreshWindowsList();
     } catch (e) {
+      // ignore
+    }
+  };
+
+  const refreshWindowsList = async () => {
+    try {
+      const res = await invoke('codexListWindows');
+      const windows = Array.isArray(res?.windows) ? res.windows : [];
+      if (!windows.length) return;
+      state.windows = windows;
+      if (state.selectedWindowId && !state.windows.some((w) => w.id === state.selectedWindowId)) {
+        state.selectedWindowId = '';
+      }
+      if (!state.selectedWindowId && state.windows[0]?.id) state.selectedWindowId = state.windows[0].id;
+      renderWindowList();
+      updateSelectedHeader();
+      for (const win of state.windows) {
+        if (win?.activeRunId && (win.status === 'running' || win.status === 'aborting')) {
+          startPolling(win.activeRunId, win.id);
+        }
+      }
+    } catch {
       // ignore
     }
   };
@@ -2498,7 +2632,7 @@ export function mount({ container, host, slots }) {
     appendEvent(state.selectedWindowId, { ts: new Date().toISOString(), source: 'system', kind: 'error', error: { message: e?.message || String(e) } }, { render: false }),
   );
   mcpTaskTimer = setInterval(() => {
-    loadMcpTasks();
+          loadMcpTasks();
   }, 2000);
 
   return () => {

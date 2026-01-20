@@ -23,8 +23,10 @@ export function mount({ container, host }) {
     selectedWindowId: '',
     logs: [],
     tasks: [],
+    mcpTasks: [],
     inputDrafts: new Map(),
   };
+  const mcpTaskGroupOpen = new Map();
 
   const LOG_ITEM_CHAR_LIMIT = 800;
   const LOG_TOOL_IO_CHAR_LIMIT = 1200;
@@ -61,6 +63,29 @@ export function mount({ container, host }) {
     const s = String(ts || '');
     if (s.length >= 19 && s.includes('T')) return s.slice(11, 19);
     return s || new Date().toISOString().slice(11, 19);
+  };
+
+  const formatTaskTime = (value) => {
+    if (!value) return '';
+    const ts = Date.parse(String(value));
+    if (!Number.isFinite(ts)) return '';
+    try {
+      return new Date(ts).toLocaleString();
+    } catch {
+      return String(value);
+    }
+  };
+
+  const getTaskStatusLabel = (task) => {
+    const status = String(task?.status || '').toLowerCase();
+    if (status === 'running') return '执行中';
+    if (status === 'completed') return '完成';
+    if (status === 'failed') return '失败';
+    if (status === 'aborted') return '已中止';
+    if (status === 'queued') {
+      return String(task?.windowStatus || '') === 'running' ? '等待当前窗口完成' : '待执行';
+    }
+    return '待执行';
   };
 
   const normalizeText = (value) => String(value ?? '').replace(/\r\n?/g, '\n');
@@ -900,8 +925,30 @@ export function mount({ container, host }) {
   tasksPanel.appendChild(tasksSummary);
   tasksPanel.appendChild(tasksList);
 
+  const mcpPanel = mkPanel();
+  const mcpTitle = document.createElement('div');
+  mcpTitle.textContent = 'MCP 任务';
+  mcpTitle.style.fontSize = '12px';
+  mcpTitle.style.color = 'var(--ds-text-secondary, var(--codex-compact-text-muted))';
+
+  const mcpSummary = document.createElement('div');
+  mcpSummary.style.fontSize = '12px';
+  mcpSummary.style.color = 'var(--ds-text-secondary, var(--codex-compact-text-muted))';
+
+  const mcpList = document.createElement('div');
+  mcpList.style.display = 'flex';
+  mcpList.style.flexDirection = 'column';
+  mcpList.style.gap = '6px';
+  mcpList.style.maxHeight = '160px';
+  mcpList.style.overflow = 'auto';
+
+  mcpPanel.appendChild(mcpTitle);
+  mcpPanel.appendChild(mcpSummary);
+  mcpPanel.appendChild(mcpList);
+
   content.appendChild(logPanel);
   content.appendChild(tasksPanel);
+  content.appendChild(mcpPanel);
 
   root.appendChild(header);
   root.appendChild(controls);
@@ -1000,6 +1047,184 @@ export function mount({ container, host }) {
     }
   };
 
+  const groupMcpTasksByWorkdir = (tasks) => {
+    const groups = [];
+    const map = new Map();
+    for (const task of tasks) {
+      const workdir = String(task?.workingDirectory || '').trim() || '未指定目录';
+      let group = map.get(workdir);
+      if (!group) {
+        group = { workdir, items: [] };
+        map.set(workdir, group);
+        groups.push(group);
+      }
+      group.items.push(task);
+    }
+    return groups;
+  };
+
+  const deleteMcpTask = async (task) => {
+    const id = String(task?.id || '');
+    if (!id) return;
+    try {
+      const res = await invoke('codexDeleteMcpTask', { taskId: id });
+      if (!res?.ok) return;
+      state.mcpTasks = state.mcpTasks.filter((item) => String(item?.id || '') !== id);
+      renderMcpTasks();
+    } catch (e) {
+      state.logs = [`[error] ${e?.message || String(e)}`];
+      renderLogs();
+    }
+  };
+
+  const buildMcpTaskRow = (task) => {
+    const row = document.createElement('div');
+    row.style.display = 'grid';
+    row.style.gap = '4px';
+    row.style.padding = '6px 8px';
+    row.style.borderRadius = '10px';
+    row.style.border = '1px solid var(--ds-panel-border, var(--codex-compact-border))';
+    row.style.background = 'var(--ds-subtle-bg, var(--codex-compact-subtle))';
+
+    const input = String(task?.input || '').trim();
+    row.title = input;
+
+    const title = document.createElement('div');
+    title.textContent = input ? input.slice(0, 28) : task?.id || 'MCP 任务';
+    title.title = input;
+    title.style.fontSize = '12px';
+    title.style.fontWeight = '700';
+    title.style.color = 'var(--ds-text-primary, var(--codex-compact-text))';
+    title.style.whiteSpace = 'nowrap';
+    title.style.overflow = 'hidden';
+    title.style.textOverflow = 'ellipsis';
+
+    const meta = document.createElement('div');
+    meta.textContent = [formatTaskTime(task?.createdAt), task?.windowName || task?.windowId || ''].filter(Boolean).join(' · ');
+    meta.style.fontSize = '11px';
+    meta.style.color = 'var(--ds-text-secondary, var(--codex-compact-text-muted))';
+    meta.style.whiteSpace = 'nowrap';
+    meta.style.overflow = 'hidden';
+    meta.style.textOverflow = 'ellipsis';
+
+    const statusRow = document.createElement('div');
+    statusRow.style.display = 'flex';
+    statusRow.style.alignItems = 'center';
+    statusRow.style.gap = '6px';
+    statusRow.style.flexWrap = 'wrap';
+
+    const statusLabel = document.createElement('div');
+    statusLabel.textContent = getTaskStatusLabel(task);
+    statusLabel.style.fontSize = '11px';
+    statusLabel.style.fontWeight = '700';
+    statusLabel.style.padding = '2px 6px';
+    statusLabel.style.borderRadius = '999px';
+    statusLabel.style.border = '1px solid var(--ds-panel-border, var(--codex-compact-border))';
+    statusLabel.style.color = 'var(--ds-text-secondary, var(--codex-compact-text-muted))';
+    statusRow.appendChild(statusLabel);
+
+    const canDelete = String(task?.status || '').toLowerCase() !== 'running';
+    if (canDelete) {
+      const btnDelete = mkBtn('删除', { variant: 'danger' });
+      btnDelete.style.padding = '4px 6px';
+      btnDelete.style.borderRadius = '8px';
+      btnDelete.style.fontSize = '11px';
+      btnDelete.addEventListener('click', (e) => {
+        e.stopPropagation();
+        deleteMcpTask(task);
+      });
+      statusRow.appendChild(btnDelete);
+    }
+
+    row.appendChild(title);
+    row.appendChild(meta);
+    row.appendChild(statusRow);
+    return row;
+  };
+
+  const buildMcpTaskGroup = (group) => {
+    const details = document.createElement('details');
+    const stored = mcpTaskGroupOpen.get(group.workdir);
+    details.open = stored === undefined ? true : stored;
+    details.style.border = '1px solid var(--ds-panel-border, var(--codex-compact-border))';
+    details.style.borderRadius = '10px';
+    details.style.background = 'var(--ds-panel-bg, var(--codex-compact-panel))';
+    details.style.padding = '6px';
+    details.addEventListener('toggle', () => {
+      mcpTaskGroupOpen.set(group.workdir, details.open);
+    });
+
+    const summary = document.createElement('summary');
+    summary.style.cursor = 'pointer';
+    summary.style.listStyle = 'none';
+    summary.style.display = 'flex';
+    summary.style.alignItems = 'center';
+    summary.style.justifyContent = 'space-between';
+    summary.style.gap = '6px';
+
+    const title = document.createElement('div');
+    title.textContent = group.workdir;
+    title.title = group.workdir;
+    title.style.fontSize = '11px';
+    title.style.fontWeight = '700';
+    title.style.color = 'var(--ds-text-primary, var(--codex-compact-text))';
+    title.style.whiteSpace = 'nowrap';
+    title.style.overflow = 'hidden';
+    title.style.textOverflow = 'ellipsis';
+    title.style.flex = '1';
+
+    const count = document.createElement('div');
+    count.textContent = String(group.items.length);
+    count.style.fontSize = '11px';
+    count.style.fontWeight = '700';
+    count.style.border = '1px solid var(--ds-panel-border, var(--codex-compact-border))';
+    count.style.borderRadius = '999px';
+    count.style.padding = '2px 6px';
+    count.style.color = 'var(--ds-text-secondary, var(--codex-compact-text-muted))';
+
+    summary.appendChild(title);
+    summary.appendChild(count);
+
+    const body = document.createElement('div');
+    body.style.display = 'flex';
+    body.style.flexDirection = 'column';
+    body.style.gap = '6px';
+    body.style.marginTop = '6px';
+    for (const task of group.items) {
+      body.appendChild(buildMcpTaskRow(task));
+    }
+
+    details.appendChild(summary);
+    details.appendChild(body);
+    return details;
+  };
+
+  const renderMcpTasks = () => {
+    const tasks = Array.isArray(state.mcpTasks) ? state.mcpTasks : [];
+    mcpList.textContent = '';
+    if (!tasks.length) {
+      mcpSummary.textContent = '暂无 MCP 任务';
+      const empty = document.createElement('div');
+      empty.textContent = '暂无 MCP 任务';
+      empty.style.fontSize = '11px';
+      empty.style.color = 'var(--ds-text-secondary, var(--codex-compact-text-muted))';
+      mcpList.appendChild(empty);
+      return;
+    }
+    mcpSummary.textContent = `共 ${tasks.length} 条`;
+    const groups = groupMcpTasksByWorkdir(tasks);
+    for (const group of groups) {
+      mcpList.appendChild(buildMcpTaskGroup(group));
+    }
+  };
+
+  const loadMcpTasks = async () => {
+    const res = await invoke('codexListMcpTasks');
+    if (!res?.ok) return;
+    state.mcpTasks = Array.isArray(res?.tasks) ? res.tasks : [];
+    renderMcpTasks();
+  };
+
   const loadLogs = async (windowId) => {
     if (!windowId) {
       state.logs = [];
@@ -1049,6 +1274,7 @@ export function mount({ container, host }) {
     await refreshWindows();
     await loadLogs(state.selectedWindowId);
     await loadTasks(state.selectedWindowId);
+    await loadMcpTasks();
   };
 
   windowSelect.addEventListener('change', () => {
@@ -1060,6 +1286,7 @@ export function mount({ container, host }) {
     setStatusMeta();
     loadLogs(state.selectedWindowId).catch(() => {});
     loadTasks(state.selectedWindowId).catch(() => {});
+    loadMcpTasks().catch(() => {});
   });
 
   btnRefresh.addEventListener('click', () => {

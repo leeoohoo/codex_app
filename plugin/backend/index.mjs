@@ -1102,6 +1102,31 @@ export async function createUiAppsBackend(ctx) {
         return { ok: true, taskId: id, requestId: task.promptRequestId };
       },
 
+      async codexDeleteMcpTask(params) {
+        const id = normalizeString(params?.taskId);
+        if (!id) throw new Error('taskId is required');
+        const task = mcpTasks.get(id);
+        if (!task) return { ok: true, taskId: id, removed: false };
+        const status = normalizeMcpTaskStatus(task.status);
+        if (status === 'running') throw new Error('cannot delete running mcp task');
+        mcpTasks.delete(id);
+
+        if (requestsFile) {
+          const requests = normalizeRequests(readJsonFile(requestsFile));
+          const startRuns = Array.isArray(requests.startRuns) ? requests.startRuns : [];
+          const filtered = startRuns.filter((entry) => normalizeString(entry?.id) !== id);
+          writeJsonFileAtomic(requestsFile, {
+            ...requests,
+            version: STATE_VERSION,
+            createWindows: Array.isArray(requests.createWindows) ? requests.createWindows : [],
+            startRuns: filtered,
+          });
+        }
+
+        scheduleStateWrite();
+        return { ok: true, taskId: id, removed: true };
+      },
+
       async codexAppendWindowInput(params, runtimeCtx) {
         await syncRequests(runtimeCtx);
         const window = getWindow(params?.windowId);
