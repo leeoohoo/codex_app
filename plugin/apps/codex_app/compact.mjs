@@ -13,6 +13,7 @@ export function mount({ container, host }) {
   };
   let activeTheme = normalizeTheme(getHostTheme());
   let themeUnsub = null;
+  let mcpTaskTimer = null;
   const invoke = async (method, params) => {
     if (!host?.backend?.invoke) throw new Error('host.backend.invoke is not available');
     return await host.backend.invoke(method, params);
@@ -1225,6 +1226,13 @@ export function mount({ container, host }) {
     renderMcpTasks();
   };
 
+  const startMcpTaskPolling = () => {
+    if (mcpTaskTimer) clearInterval(mcpTaskTimer);
+    mcpTaskTimer = setInterval(() => {
+      loadMcpTasks().catch(() => {});
+    }, 3000);
+  };
+
   const loadLogs = async (windowId) => {
     if (!windowId) {
       state.logs = [];
@@ -1287,13 +1295,18 @@ export function mount({ container, host }) {
     loadLogs(state.selectedWindowId).catch(() => {});
     loadTasks(state.selectedWindowId).catch(() => {});
     loadMcpTasks().catch(() => {});
+    startMcpTaskPolling();
   });
 
   btnRefresh.addEventListener('click', () => {
-    refreshAll().catch((e) => {
-      state.logs = [`[error] ${e?.message || String(e)}`];
-      renderLogs();
-    });
+    refreshAll()
+      .then(() => {
+        startMcpTaskPolling();
+      })
+      .catch((e) => {
+        state.logs = [`[error] ${e?.message || String(e)}`];
+        renderLogs();
+      });
   });
 
   btnStop.addEventListener('click', async () => {
@@ -1365,6 +1378,7 @@ export function mount({ container, host }) {
     state.logs = [`[error] ${e?.message || String(e)}`];
     renderLogs();
   });
+  startMcpTaskPolling();
 
   try {
     container.textContent = '';
@@ -1382,6 +1396,7 @@ export function mount({ container, host }) {
       }
       themeUnsub = null;
     }
+    if (mcpTaskTimer) clearInterval(mcpTaskTimer);
     try {
       container.textContent = '';
     } catch {
