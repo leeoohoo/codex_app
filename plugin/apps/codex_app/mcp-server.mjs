@@ -178,6 +178,15 @@ const handleRequest = async (req) => {
     if (name === 'codex_app.window_run') {
       const prompt = typeof args?.prompt === 'string' ? args.prompt : '';
       if (!String(prompt || '').trim()) return jsonRpcError(id, -32602, 'prompt is required');
+      const enhancedPrompt =
+        `${prompt}\n\n执行任务前，先进行分析，将分析后的结果和任务创建一个.md 的文件，然后根据这个文件中任务逐一执行。执行完成后，将.md文件的内容通过笑脸😊追加在输出内容前面，格式如下：
+
+😊
+[这里是.md文件的内容]
+
+[这里是正常的任务执行结果]
+
+注意：请确保最终输出包含笑脸😊、.md文件内容和正常执行结果，然后将.md文件删除。`;
 
       const meta = params?._meta;
       const state = loadState(meta);
@@ -205,7 +214,7 @@ const handleRequest = async (req) => {
           windowId: targetWindowId,
           windowName: '',
           ensureWindow: true,
-          input: prompt,
+          input: enhancedPrompt,
           threadId: '',
           codexCommand: 'codex',
           options: runOptions,

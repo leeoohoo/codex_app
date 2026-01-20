@@ -95,6 +95,135 @@ export async function createUiAppsBackend(ctx) {
     };
   };
 
+  const normalizeMultilineText = (value) => {
+    if (value === undefined || value === null) return '';
+    return String(value).replace(/\r\n?/g, '\n');
+  };
+
+  const pickFirstText = (...values) => {
+    for (const value of values) {
+      if (typeof value !== 'string') continue;
+      if (!value.trim()) continue;
+      return normalizeMultilineText(value);
+    }
+    return '';
+  };
+
+  const pickFirstPath = (...values) => {
+    for (const value of values) {
+      if (typeof value !== 'string') continue;
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+    }
+    return '';
+  };
+
+  const normalizePathForMatch = (value) =>
+    String(value || '')
+      .replace(/\\/g, '/')
+      .replace(/^[ab]\//, '')
+      .toLowerCase();
+
+  const isMarkdownPath = (value) => {
+    const normalized = normalizePathForMatch(value);
+    return normalized.endsWith('.md');
+  };
+
+  const extractMarkdownFromPatch = (patch, targetPath) => {
+    const text = normalizeMultilineText(patch);
+    if (!text) return '';
+    const target = targetPath ? normalizePathForMatch(targetPath) : '';
+    const lines = text.split('\n');
+    let collecting = false;
+    let matched = false;
+    let collected = [];
+
+    for (const line of lines) {
+      if (line.startsWith('+++ ')) {
+        const filePath = normalizePathForMatch(line.slice(4).trim());
+        collecting = Boolean(filePath) && (target ? filePath === target : filePath.endsWith('.md'));
+        if (collecting) {
+          matched = true;
+          collected = [];
+        }
+        continue;
+      }
+      if (!collecting) continue;
+      if (line.startsWith('@@') || line.startsWith('\\')) continue;
+      if (line.startsWith('+') && !line.startsWith('+++')) {
+        collected.push(line.slice(1));
+        continue;
+      }
+      if (line.startsWith(' ') || line === '') {
+        collected.push(line.startsWith(' ') ? line.slice(1) : line);
+      }
+    }
+
+    const result = collected.join('\n').trimEnd();
+    return matched && result ? result : '';
+  };
+
+  const extractMarkdownContentFromItem = (item) => {
+    if (!item || typeof item !== 'object') return { content: '', path: '' };
+    const directPath = pickFirstPath(item.path, item.file, item.file_path, item.filepath);
+    if (directPath && isMarkdownPath(directPath)) {
+      const content = pickFirstText(item.content, item.after, item.text, item.output_text, item.outputText);
+      if (content) return { content, path: directPath };
+      const patch = pickFirstText(item.patch, item.diff);
+      const extracted = extractMarkdownFromPatch(patch, directPath);
+      if (extracted) return { content: extracted, path: directPath };
+    }
+
+    if (Array.isArray(item.changes)) {
+      for (const change of item.changes) {
+        const changePath = pickFirstPath(change?.path, change?.file, change?.file_path, change?.filepath);
+        if (!changePath || !isMarkdownPath(changePath)) continue;
+        const content = pickFirstText(change?.content, change?.after, change?.text, change?.output_text, change?.outputText);
+        if (content) return { content, path: changePath };
+        const patch = pickFirstText(change?.patch, change?.diff);
+        const extracted = extractMarkdownFromPatch(patch, changePath);
+        if (extracted) return { content: extracted, path: changePath };
+      }
+    }
+
+    const patch = pickFirstText(item.patch, item.diff);
+    const extracted = extractMarkdownFromPatch(patch);
+    if (extracted) return { content: extracted, path: '' };
+    return { content: '', path: '' };
+  };
+
+  const extractMarkdownContentFromEvent = (evt) => {
+    if (!evt || typeof evt !== 'object') return { content: '', path: '' };
+    const type = normalizeString(evt.type).toLowerCase();
+    if (type !== 'item.completed' && type !== 'item.updated') return { content: '', path: '' };
+    return extractMarkdownContentFromItem(evt.item);
+  };
+
+  const storePlanMarkdown = (run, content, path) => {
+    if (!run || !content) return;
+    if (path) {
+      const normalizedPath = normalizePathForMatch(path);
+      const existingPath = normalizePathForMatch(run.planMarkdownPath);
+      if (!existingPath || existingPath === normalizedPath) {
+        run.planMarkdownPath = path;
+        run.planMarkdown = content;
+      }
+      return;
+    }
+    if (!run.planMarkdownPath && !run.planMarkdown) {
+      run.planMarkdown = content;
+    }
+  };
+
+  const buildResultTextWithPlan = (run) => {
+    const planText = normalizeMultilineText(run?.planMarkdown).trim();
+    const outputText = normalizeMultilineText(pickAssistantMessage(run)).trim();
+    if (!planText) return outputText;
+    const parts = ['😊', planText];
+    if (outputText) parts.push(outputText);
+    return parts.join('\n\n');
+  };
+
   const pruneMcpTasks = () => {
     if (mcpTasks.size <= MAX_MCP_TASKS) return;
     const list = Array.from(mcpTasks.values());
@@ -189,7 +318,7 @@ export async function createUiAppsBackend(ctx) {
   const applyMcpTaskResult = (task, run) => {
     if (!task) return;
     task.resultStatus = normalizeMcpTaskStatus(run?.status || task.status);
-    task.resultText = truncateResultText(pickAssistantMessage(run));
+    task.resultText = truncateResultText(buildResultTextWithPlan(run));
     task.resultAt = nowIso();
     scheduleStateWrite();
   };
@@ -210,7 +339,7 @@ export async function createUiAppsBackend(ctx) {
     if (task.workingDirectory) parts.push(`**目录**：\`${task.workingDirectory}\``);
     if (task.windowId) parts.push(`**窗口**：\`${task.windowId}\``);
     if (runStatus) parts.push(`**状态**：${statusLabel}`);
-    const outputText = truncateResultText(pickAssistantMessage(run));
+    const outputText = task.resultText || truncateResultText(buildResultTextWithPlan(run));
     if (outputText) parts.push(`**输出**：\n\n${outputText}`);
     const errorMessage = task.error?.message || run?.error?.message;
     if (errorMessage) parts.push(`**错误**：${errorMessage}`);
@@ -744,6 +873,8 @@ export async function createUiAppsBackend(ctx) {
         todoList: [],
         todoListId: '',
         todoListUpdatedAt: '',
+        planMarkdown: '',
+        planMarkdownPath: '',
         child: null,
       };
       runs.set(runId, run);
@@ -894,6 +1025,10 @@ export async function createUiAppsBackend(ctx) {
               }
             }
             pushRunEvent(run, { source: 'codex', event: evt });
+            const planCapture = extractMarkdownContentFromEvent(evt);
+            if (planCapture.content) {
+              storePlanMarkdown(run, planCapture.content, planCapture.path);
+            }
           } catch (e) {
             pushRunEvent(run, {
               source: 'raw',
