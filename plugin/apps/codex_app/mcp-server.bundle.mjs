@@ -366,9 +366,10 @@ var scheduleCompletionNotification = ({ requestId, windowId, requestedAt, meta, 
   poll();
   return token;
 };
+var WINDOW_RUN_TOOL = "codex_app_window_run";
 var TOOLS = [
   {
-    name: "codex_app.window_run",
+    name: WINDOW_RUN_TOOL,
     description: "Queue a run in a UI window (async). Returns immediate ack; emits a smiley on completion.",
     inputSchema: {
       type: "object",
@@ -400,9 +401,9 @@ var handleRequest = async (req) => {
     return jsonRpcResult(id, { tools: TOOLS });
   }
   if (method === "tools/call") {
-    const name = String(params?.name || "");
+    const name = normalizeString(params?.name);
     const args = params?.arguments || {};
-    if (name === "codex_app.window_run") {
+    if (name === WINDOW_RUN_TOOL) {
       const prompt = typeof args?.prompt === "string" ? args.prompt : "";
       if (!String(prompt || "").trim()) return jsonRpcError(id, -32602, "prompt is required");
       const meta = params?._meta;
