@@ -2,7 +2,7 @@ node_modules/
 .DS_Store
 .chatos/
 *.log
-
+.deepseek_cli/
 # build outputs (if you add bundling later)
 dist/
 \"codex_doc/codex/.git/\" 
