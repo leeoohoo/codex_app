@@ -198,6 +198,14 @@ const writeJsonFileAtomic = (filePath, data) => {
   }
 };
 
+const normalizeRequests = (raw) => {
+  const data = raw && typeof raw === 'object' ? { ...raw } : {};
+  if (!Array.isArray(data.createWindows)) data.createWindows = [];
+  if (!Array.isArray(data.startRuns)) data.startRuns = [];
+  data.version = STATE_VERSION;
+  return data;
+};
+
 const findUpwardsDataDir = (startPath, pluginId) => {
   const raw = normalizeString(startPath);
   if (!raw) return '';
@@ -655,19 +663,20 @@ export async function createUiAppsBackend(ctx) {
     }, 120);
   };
 
-  const syncRequests = () => {
+  const syncRequests = async (runtimeCtx) => {
     if (!requestsFile) return;
-    const requests = readJsonFile(requestsFile) || {};
-    const createWindows = Array.isArray(requests.createWindows) ? requests.createWindows : [];
-    if (!createWindows.length) return;
+    const requests = normalizeRequests(readJsonFile(requestsFile));
+    const createWindows = requests.createWindows;
+    const startRuns = requests.startRuns;
+    if (!createWindows.length && !startRuns.length) return;
 
-    const pending = [];
+    const pendingWindows = [];
     for (const req of createWindows) {
       const reqId = normalizeString(req?.id);
       const id = reqId || makeId();
       const defaults = normalizeRunOptions(req?.defaults || {});
       if (!defaults.workingDirectory || !defaults.sandboxMode) {
-        pending.push(req);
+        pendingWindows.push(req);
         continue;
       }
       const name = normalizeString(req?.name) || `Codex ${id.slice(0, 8)}`;
@@ -682,7 +691,54 @@ export async function createUiAppsBackend(ctx) {
       }
     }
 
-    writeJsonFileAtomic(requestsFile, { version: STATE_VERSION, createWindows: pending });
+    const pendingRuns = [];
+    for (const req of startRuns) {
+      const input = normalizeString(req?.input ?? req?.prompt);
+      if (!input) continue;
+
+      const ensureWindow = req?.ensureWindow === undefined ? true : Boolean(req.ensureWindow);
+      const windowId = normalizeString(req?.windowId);
+      const windowName = normalizeString(req?.windowName);
+      const options = normalizeRunOptions(req?.options || {});
+      const defaults = normalizeRunOptions(req?.defaults || {});
+      const threadId = normalizeString(req?.threadId);
+      const codexCommand = normalizeString(req?.codexCommand) || 'codex';
+
+      let window = windowId ? windows.get(windowId) : null;
+      if (!window && ensureWindow) {
+        if (!defaults.workingDirectory || !defaults.sandboxMode) {
+          pendingRuns.push(req);
+          continue;
+        }
+        window = createWindow({ id: windowId || makeId(), name: windowName, threadId, defaults, source: 'mcp' });
+      }
+
+      if (!window) {
+        continue;
+      }
+      if (window.status === 'running' || window.status === 'aborting') {
+        pendingRuns.push(req);
+        continue;
+      }
+
+      await startRun(
+        {
+          windowId: window.id,
+          input,
+          codexCommand,
+          options,
+          threadId,
+        },
+        runtimeCtx,
+      );
+    }
+
+    writeJsonFileAtomic(requestsFile, {
+      ...requests,
+      version: STATE_VERSION,
+      createWindows: pendingWindows,
+      startRuns: pendingRuns,
+    });
     scheduleStateWrite();
   };
 
@@ -1139,8 +1195,8 @@ export async function createUiAppsBackend(ctx) {
         };
       },
 
-      async codexListWindows() {
-        syncRequests();
+      async codexListWindows(_params, runtimeCtx) {
+        await syncRequests(runtimeCtx);
         scheduleStateWrite();
         return {
           ok: true,
@@ -1148,8 +1204,8 @@ export async function createUiAppsBackend(ctx) {
         };
       },
 
-      async codexGetWindowTasks(params) {
-        syncRequests();
+      async codexGetWindowTasks(params, runtimeCtx) {
+        await syncRequests(runtimeCtx);
         const window = getWindow(params?.windowId);
         return {
           ok: true,
@@ -1160,8 +1216,8 @@ export async function createUiAppsBackend(ctx) {
         };
       },
 
-      async codexGetWindowInputs(params) {
-        syncRequests();
+      async codexGetWindowInputs(params, runtimeCtx) {
+        await syncRequests(runtimeCtx);
         const window = getWindow(params?.windowId);
         const entry = windowInputs.get(window.id) || { items: [], updatedAt: '' };
         return {
@@ -1172,8 +1228,8 @@ export async function createUiAppsBackend(ctx) {
         };
       },
 
-      async codexAppendWindowInput(params) {
-        syncRequests();
+      async codexAppendWindowInput(params, runtimeCtx) {
+        await syncRequests(runtimeCtx);
         const window = getWindow(params?.windowId);
         const text = normalizeString(params?.text);
         if (!text) throw new Error('text is required');
@@ -1186,22 +1242,22 @@ export async function createUiAppsBackend(ctx) {
         };
       },
 
-      async codexClearWindowInputs(params) {
-        syncRequests();
+      async codexClearWindowInputs(params, runtimeCtx) {
+        await syncRequests(runtimeCtx);
         const window = getWindow(params?.windowId);
         windowInputs.set(window.id, { items: [], updatedAt: nowIso() });
         scheduleStateWrite();
         return { ok: true, windowId: window.id };
       },
 
-      async codexCreateWindow(params) {
-        syncRequests();
+      async codexCreateWindow(params, runtimeCtx) {
+        await syncRequests(runtimeCtx);
         const window = createWindow({ name: params?.name });
         return { ok: true, window };
       },
 
-      async codexResumeWindow(params) {
-        syncRequests();
+      async codexResumeWindow(params, runtimeCtx) {
+        await syncRequests(runtimeCtx);
         const threadId = normalizeString(params?.threadId);
         if (!threadId) throw new Error('threadId is required');
         const window = createWindow({ name: params?.name, threadId });
@@ -1269,7 +1325,7 @@ export async function createUiAppsBackend(ctx) {
       },
 
       async codexRun(params, runtimeCtx) {
-        syncRequests();
+        await syncRequests(runtimeCtx);
         return await startRun(params, runtimeCtx);
       },
 
