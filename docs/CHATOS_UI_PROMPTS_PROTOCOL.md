@@ -6,14 +6,14 @@ UI Prompts 是 ChatOS 的全局交互队列：任意组件（AI / MCP / UI Apps�
 
 - 存储格式：`ui-prompts.jsonl`（JSON Lines 追加日志）
 - 交互生命周期：`request` → `response`
-- UI 渲染支持的 `prompt.kind` 与字段（`kv` / `choice` / `task_confirm` / `file_change_confirm`）
+- UI 渲染支持的 `prompt.kind` 与字段（`kv` / `choice` / `task_confirm` / `file_change_confirm` / `result`）
 - UI Apps 的 Host API 调用方式（`host.uiPrompts.*`）
 
 实现对照（以代码为准）：
 
-- UI 渲染：`deepseek_cli/apps/ui/src/features/session/floating-island/FloatingIslandPrompt.jsx`
-- 笑脸面板：`deepseek_cli/apps/ui/src/components/UiPromptsSmileHub.jsx`
-- Host IPC：`deepseek_cli/electron/main.js`（`uiPrompts:*`）
+- UI 渲染：`chatos/apps/ui/src/features/session/floating-island/FloatingIslandPrompt.jsx`
+- 笑脸面板：`chatos/apps/ui/src/components/UiPromptsSmileHub.jsx`
+- Host IPC：`chatos/electron/main.js`（`uiPrompts:*`）
 - 写入/读取日志：`aide/electron/session-api.js`（`requestUiPrompt` / `respondUiPrompt` / `readUiPromptsPayload`）
 - MCP `ui_prompter`：`aide/mcp_servers/ui-prompt-server.js`
 
@@ -146,7 +146,7 @@ UI Apps 的 `module` 应用通过 Host API 与 UI Prompts 交互：
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---:|---:|---|
-| `kind` | `string` | 是 | 取值：`kv` / `choice` / `task_confirm` / `file_change_confirm` |
+| `kind` | `string` | 是 | 取值：`kv` / `choice` / `task_confirm` / `file_change_confirm` / `result` |
 | `title` | `string` | 否 | UI 标题 |
 | `message` | `string` | 否 | UI 描述/说明 |
 | `source` | `string` | 否 | 来源标识（UI 显示 Tag） |
@@ -376,7 +376,36 @@ UI 渲染规则：
 
 ---
 
-## 9. 复杂交互的构建方式
+## 9. `kind="result"`：执行结果（Markdown 展示）
+
+该类型用于“执行完成后的结果通知”。UI 会以 Markdown 形式展示结果，并在用户确认后写入 `response`。
+
+### 9.1 请求结构
+
+```json
+{
+  "kind": "result",
+  "title": "执行结果",
+  "message": "已完成全部步骤。",
+  "source": "com.example.plugin:my-app",
+  "allowCancel": true,
+  "markdown": "## Done\n- step 1\n- step 2"
+}
+```
+
+字段：
+
+- `markdown`：可选字符串；作为 Markdown 内容展示
+
+### 9.2 响应结构
+
+```json
+{ "status": "ok" }
+```
+
+---
+
+## 10. 复杂交互的构建方式
 
 UI Prompts 的基本单位是一条 `request` 记录。复杂交互由多条 `request/response` 串联构成：
 
@@ -390,3 +419,4 @@ UI Prompts 的基本单位是一条 `request` 记录。复杂交互由多条 `re
 - “多选/单选”使用 `kind="choice"` 的 `multiple/options` 承载
 - “任务列表确认”使用 `kind="task_confirm"` 承载
 - “diff/命令确认”使用 `kind="file_change_confirm"` 承载
+- “执行结果通知”使用 `kind="result"` 承载
