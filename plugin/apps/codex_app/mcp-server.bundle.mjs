@@ -406,6 +406,9 @@ var handleRequest = async (req) => {
     if (name === WINDOW_RUN_TOOL) {
       const prompt = typeof args?.prompt === "string" ? args.prompt : "";
       if (!String(prompt || "").trim()) return jsonRpcError(id, -32602, "prompt is required");
+      const enhancedPrompt = `${prompt}
+
+执行任务前，先进行分析，将分析后的结果和任务创建根目录下的 codex_plan.md 文件，然后根据这个文件中任务逐一执行。完成后请保留该文件，系统会读取并删除。`;
       const meta = params?._meta;
       const state = loadState(meta);
       const windows = sortWindowsByRecent(Array.isArray(state?.windows) ? state.windows : []);
@@ -431,7 +434,7 @@ var handleRequest = async (req) => {
           windowId: targetWindowId,
           windowName: "",
           ensureWindow: true,
-          input: prompt,
+          input: enhancedPrompt,
           threadId: "",
           codexCommand: "codex",
           options: runOptions,
@@ -482,3 +485,4 @@ rl.on("line", async (line) => {
     send(jsonRpcError(req.id, -32e3, e?.message || String(e)));
   }
 });
+
