@@ -1,0 +1,49 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
+export const ensureDir = (dir) => {
+  if (!dir) return;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch {
+    // ignore
+  }
+};
+
+export const readJsonFile = (filePath) => {
+  if (!filePath) return null;
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const raw = fs.readFileSync(filePath, 'utf8');
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+export const writeJsonFileAtomic = (filePath, data) => {
+  if (!filePath) return;
+  try {
+    const dir = path.dirname(filePath);
+    ensureDir(dir);
+    const temp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(data, null, 2));
+    fs.renameSync(temp, filePath);
+  } catch {
+    // ignore
+  }
+};
+
+export const appendJsonlFile = (filePath, entry) => {
+  if (!filePath || !entry) return;
+  try {
+    const dir = path.dirname(filePath);
+    ensureDir(dir);
+    const line = `${JSON.stringify(entry)}\n`;
+    fs.appendFileSync(filePath, line);
+  } catch {
+    // ignore
+  }
+};

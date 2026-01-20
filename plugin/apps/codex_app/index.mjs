@@ -1,3 +1,17 @@
+import { createThemeManager } from './ui/theme.mjs';
+import { createDomHelpers } from './ui/dom.mjs';
+import {
+  clampNumber,
+  collapseWhitespace,
+  ensureClosedFences,
+  formatCodexItem,
+  formatTime,
+  formatValueForMarkdown,
+  normalizeTodoItems,
+  renderMarkdown,
+  truncateText,
+} from './ui/format.mjs';
+
 export function mount({ container, host, slots }) {
   if (!container) throw new Error('container is required');
   if (!host || typeof host !== 'object') throw new Error('host is required');
@@ -7,17 +21,6 @@ export function mount({ container, host, slots }) {
 
   const ctx = typeof host?.context?.get === 'function' ? host.context.get() : { pluginId: '', appId: '', theme: 'light' };
   const bridgeEnabled = Boolean(ctx?.bridge?.enabled);
-
-  const normalizeTheme = (value) => (String(value || '').toLowerCase() === 'dark' ? 'dark' : 'light');
-  const getHostTheme = () => {
-    try {
-      if (typeof host?.theme?.get === 'function') return host.theme.get();
-    } catch {
-      // ignore
-    }
-    return ctx?.theme || document?.documentElement?.dataset?.theme || '';
-  };
-  let activeTheme = normalizeTheme(getHostTheme());
 
   const colors = {
     pageBg: 'var(--codex-page-bg)',
@@ -44,112 +47,11 @@ export function mount({ container, host, slots }) {
     panelShadow: 'var(--codex-panel-shadow)',
     titleGlow: 'var(--codex-title-glow)',
   };
+  const themeManager = createThemeManager({ host, ctx, colors });
+  const { registerSelect, setRenderMeta, setRoot, subscribe } = themeManager;
 
-  const themeTokens = {
-    dark: {
-      pageBg:
-        'radial-gradient(1200px 700px at 18% 12%, rgba(34,211,238,0.18), transparent 55%), radial-gradient(1000px 600px at 78% 8%, rgba(167,139,250,0.16), transparent 55%), radial-gradient(900px 600px at 30% 90%, rgba(96,165,250,0.10), transparent 55%), linear-gradient(180deg, #05070d 0%, #050913 55%, #05070d 100%)',
-      border: 'var(--ds-panel-border, rgba(255,255,255,0.12))',
-      borderStrong: 'var(--ds-panel-border, rgba(255,255,255,0.18))',
-      bg: 'var(--ds-subtle-bg, rgba(255,255,255,0.06))',
-      bgHover: 'var(--ds-selected-bg, rgba(255,255,255,0.09))',
-      panel: 'var(--ds-panel-bg, rgba(255,255,255,0.04))',
-      panelHover: 'var(--ds-panel-bg, rgba(255,255,255,0.06))',
-      logBg: 'var(--ds-code-bg, rgba(0,0,0,0.55))',
-      textMuted: 'rgba(255,255,255,0.70)',
-      textStrong: 'rgba(255,255,255,0.92)',
-      accent: 'var(--ds-accent, #22d3ee)',
-      accent2: 'var(--ds-accent-2, #a78bfa)',
-      accentBorder: 'var(--ds-accent, rgba(34,211,238,0.55))',
-      accentGlow: 'rgba(34,211,238,0.16)',
-      gridOpacity: '0.12',
-      danger: '#ef4444',
-      dangerBorder: 'rgba(239,68,68,0.55)',
-      dangerBg: 'rgba(239,68,68,0.12)',
-      dangerBgHover: 'rgba(239,68,68,0.16)',
-      primaryText: '#071018',
-      shadow: '0 22px 70px rgba(0,0,0,0.45)',
-      panelShadow: 'var(--ds-panel-shadow, 0 16px 50px rgba(0,0,0,0.35))',
-      titleGlow: '0 0 22px rgba(34,211,238,0.20)',
-    },
-    light: {
-      pageBg:
-        'radial-gradient(1200px 700px at 18% 12%, rgba(37,99,235,0.12), transparent 58%), radial-gradient(900px 600px at 78% 8%, rgba(6,182,212,0.10), transparent 55%), linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%)',
-      border: 'var(--ds-panel-border, rgba(0,0,0,0.12))',
-      borderStrong: 'var(--ds-panel-border, rgba(0,0,0,0.18))',
-      bg: 'var(--ds-subtle-bg, rgba(0,0,0,0.04))',
-      bgHover: 'var(--ds-selected-bg, rgba(0,0,0,0.06))',
-      panel: 'var(--ds-panel-bg, rgba(0,0,0,0.02))',
-      panelHover: 'var(--ds-panel-bg, rgba(0,0,0,0.04))',
-      logBg: 'var(--ds-code-bg, rgba(255,255,255,0.75))',
-      textMuted: 'rgba(0,0,0,0.65)',
-      textStrong: 'rgba(0,0,0,0.92)',
-      accent: 'var(--ds-accent, #2563eb)',
-      accent2: 'var(--ds-accent-2, #06b6d4)',
-      accentBorder: 'var(--ds-accent, rgba(37,99,235,0.55))',
-      accentGlow: 'rgba(37,99,235,0.16)',
-      gridOpacity: '0.06',
-      danger: '#ef4444',
-      dangerBorder: 'rgba(239,68,68,0.55)',
-      dangerBg: 'rgba(239,68,68,0.10)',
-      dangerBgHover: 'rgba(239,68,68,0.12)',
-      primaryText: '#ffffff',
-      shadow: '0 18px 55px rgba(2,6,23,0.12)',
-      panelShadow: 'var(--ds-panel-shadow, 0 14px 40px rgba(2,6,23,0.10))',
-      titleGlow: '0 0 18px rgba(37,99,235,0.12)',
-    },
-  };
-
-  let renderMeta = null;
   let themeUnsub = null;
-  const themedSelects = new Set();
-
-  const applySelectTheme = (select) => {
-    if (!select) return;
-    select.style.colorScheme = activeTheme;
-    select.style.background = colors.bg;
-    select.style.color = colors.textStrong;
-    select.style.borderColor = colors.borderStrong;
-    const options = select.querySelectorAll('option');
-    options.forEach((opt) => {
-      opt.style.background = colors.panel;
-      opt.style.color = colors.textStrong;
-    });
-  };
-
-  const applyTheme = (theme) => {
-    const nextTheme = normalizeTheme(theme);
-    activeTheme = nextTheme;
-    const palette = themeTokens[nextTheme] || themeTokens.light;
-    if (root) {
-      root.dataset.theme = nextTheme;
-      root.style.setProperty('--codex-page-bg', palette.pageBg);
-      root.style.setProperty('--codex-border', palette.border);
-      root.style.setProperty('--codex-border-strong', palette.borderStrong);
-      root.style.setProperty('--codex-bg', palette.bg);
-      root.style.setProperty('--codex-bg-hover', palette.bgHover);
-      root.style.setProperty('--codex-panel', palette.panel);
-      root.style.setProperty('--codex-panel-hover', palette.panelHover);
-      root.style.setProperty('--codex-log-bg', palette.logBg);
-      root.style.setProperty('--codex-text-muted', palette.textMuted);
-      root.style.setProperty('--codex-text-strong', palette.textStrong);
-      root.style.setProperty('--codex-accent', palette.accent);
-      root.style.setProperty('--codex-accent-2', palette.accent2);
-      root.style.setProperty('--codex-accent-border', palette.accentBorder);
-      root.style.setProperty('--codex-accent-glow', palette.accentGlow);
-      root.style.setProperty('--codex-grid-opacity', palette.gridOpacity);
-      root.style.setProperty('--codex-danger', palette.danger);
-      root.style.setProperty('--codex-danger-border', palette.dangerBorder);
-      root.style.setProperty('--codex-danger-bg', palette.dangerBg);
-      root.style.setProperty('--codex-danger-bg-hover', palette.dangerBgHover);
-      root.style.setProperty('--codex-primary-text', palette.primaryText);
-      root.style.setProperty('--codex-shadow', palette.shadow);
-      root.style.setProperty('--codex-panel-shadow', palette.panelShadow);
-      root.style.setProperty('--codex-title-glow', palette.titleGlow);
-    }
-    if (renderMeta) renderMeta(nextTheme);
-    themedSelects.forEach((select) => applySelectTheme(select));
-  };
+  let mcpTaskTimer = null;
 
   const styleEl = document.createElement('style');
   styleEl.textContent = `
@@ -214,183 +116,10 @@ export function mount({ container, host, slots }) {
     // ignore
   }
 
-  const el = (tag, style) => {
-    const node = document.createElement(tag);
-    if (style && typeof style === 'object') Object.assign(node.style, style);
-    return node;
-  };
-
-  const mkBtn = (label, { variant = 'default' } = {}) => {
-    const isPrimary = variant === 'primary';
-    const isDanger = variant === 'danger';
-    const btn = el('button', {
-      padding: '9px 10px',
-      borderRadius: '12px',
-      border: `1px solid ${isPrimary ? colors.accentBorder : isDanger ? colors.dangerBorder : colors.borderStrong}`,
-      background: isPrimary
-        ? `linear-gradient(135deg, ${colors.accent} 0%, ${colors.accent2} 80%)`
-        : isDanger
-          ? colors.dangerBg
-          : colors.bg,
-      cursor: 'pointer',
-      fontWeight: '650',
-      color: isPrimary ? colors.primaryText : isDanger ? colors.danger : colors.textStrong,
-    });
-    btn.type = 'button';
-    btn.textContent = label;
-    btn.addEventListener('mouseenter', () => {
-      if (isPrimary) btn.style.filter = 'brightness(1.05)';
-      else if (isDanger) btn.style.background = colors.dangerBgHover;
-      else btn.style.background = colors.bgHover;
-    });
-    btn.addEventListener('mouseleave', () => {
-      btn.style.filter = '';
-      btn.style.background = isPrimary
-        ? `linear-gradient(135deg, ${colors.accent} 0%, ${colors.accent2} 80%)`
-        : isDanger
-          ? colors.dangerBg
-          : colors.bg;
-    });
-    return btn;
-  };
-
-  const mkInput = (placeholder) => {
-    const input = el('input', {
-      width: '100%',
-      boxSizing: 'border-box',
-      borderRadius: '12px',
-      border: `1px solid ${colors.borderStrong}`,
-      background: colors.bg,
-      padding: '9px 10px',
-      outline: 'none',
-      color: colors.textStrong,
-    });
-    input.type = 'text';
-    input.placeholder = placeholder || '';
-    return input;
-  };
-
-  const mkSelect = (options) => {
-    const select = el('select', {
-      width: '100%',
-      boxSizing: 'border-box',
-      borderRadius: '12px',
-      border: `1px solid ${colors.borderStrong}`,
-      background: colors.bg,
-      padding: '9px 10px',
-      outline: 'none',
-      color: colors.textStrong,
-    });
-    for (const opt of options) {
-      const o = document.createElement('option');
-      o.value = opt.value;
-      o.textContent = opt.label;
-      select.appendChild(o);
-    }
-    themedSelects.add(select);
-    applySelectTheme(select);
-    return select;
-  };
-
-  const mkCheckbox = (label) => {
-    const wrap = el('label', { display: 'flex', alignItems: 'center', gap: '8px', userSelect: 'none' });
-    const input = document.createElement('input');
-    input.type = 'checkbox';
-    const text = el('div', { fontSize: '12px', color: colors.textMuted });
-    text.textContent = label;
-    wrap.appendChild(input);
-    wrap.appendChild(text);
-    return { wrap, input };
-  };
-
-  const mkField = (label, control, { hint = '', fullWidth = false } = {}) => {
-    const wrap = el('div', { display: 'flex', flexDirection: 'column', gap: '6px' });
-    const title = el('div', { fontSize: '12px', color: colors.textMuted, fontWeight: '650' });
-    title.textContent = label;
-    wrap.appendChild(title);
-    wrap.appendChild(control);
-    if (hint) {
-      const hintEl = el('div', { fontSize: '12px', color: colors.textMuted, lineHeight: '1.4' });
-      hintEl.textContent = hint;
-      wrap.appendChild(hintEl);
-    }
-    if (fullWidth) wrap.style.gridColumn = '1 / -1';
-    return wrap;
-  };
-
-  const mkGroup = (title, { subtitle = '', compact = false } = {}) => {
-    const groupPadding = compact ? '8px 10px' : '12px';
-    const groupGap = compact ? '6px' : '10px';
-    const headGap = compact ? '6px' : '10px';
-    const bodyGap = compact ? '8px' : '10px';
-    const wrap = el('div', {
-      border: `1px solid ${colors.border}`,
-      borderRadius: '14px',
-      background: colors.panelHover,
-      padding: groupPadding,
-      display: 'flex',
-      flexDirection: 'column',
-      gap: groupGap,
-      backdropFilter: 'blur(10px)',
-      WebkitBackdropFilter: 'blur(10px)',
-    });
-    const head = el('div', {
-      display: 'flex',
-      alignItems: compact ? 'center' : 'baseline',
-      justifyContent: 'space-between',
-      gap: headGap,
-      flexWrap: 'wrap',
-    });
-    const h = el('div', { fontWeight: '850', color: colors.textStrong, letterSpacing: '0.2px', fontSize: compact ? '13px' : '' });
-    h.textContent = title;
-    head.appendChild(h);
-    if (subtitle) {
-      const s = el('div', { fontSize: compact ? '11px' : '12px', color: colors.textMuted });
-      s.textContent = subtitle;
-      head.appendChild(s);
-    }
-    const body = el('div', { display: 'grid', gap: bodyGap });
-    wrap.appendChild(head);
-    wrap.appendChild(body);
-    return { wrap, body };
-  };
-
-  const styleCheckboxCard = (wrap) => {
-    Object.assign(wrap.style, {
-      border: `1px solid ${colors.borderStrong}`,
-      borderRadius: '12px',
-      background: colors.bg,
-      padding: '10px 10px',
-      boxSizing: 'border-box',
-      minHeight: '40px',
-    });
-  };
-
-  const mkBadge = (text, { fg = colors.textMuted, bg = 'transparent', border = colors.borderStrong } = {}) => {
-    const badge = el('div', {
-      display: 'inline-flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      padding: '2px 8px',
-      borderRadius: '999px',
-      border: `1px solid ${border}`,
-      color: fg,
-      background: bg,
-      fontSize: '11px',
-      fontWeight: '750',
-      lineHeight: '1.4',
-      userSelect: 'none',
-      whiteSpace: 'nowrap',
-    });
-    badge.textContent = String(text || '');
-    return badge;
-  };
-
-  const mkTag = (text, { fg = colors.textStrong, bg = colors.bg, border = colors.accentBorder } = {}) => {
-    const tag = mkBadge(text, { fg, bg, border });
-    tag.style.cursor = 'pointer';
-    return tag;
-  };
+  const { el, mkBtn, mkInput, mkSelect, mkCheckbox, mkField, mkGroup, styleCheckboxCard, mkBadge, mkTag } = createDomHelpers({
+    colors,
+    registerSelect,
+  });
 
   const state = {
     env: null,
@@ -401,6 +130,7 @@ export function mount({ container, host, slots }) {
     windowInputs: new Map(), // windowId -> { ts, text }[]
     inputPages: new Map(), // windowId -> page index
     inputDrafts: new Map(), // windowId -> draft text
+    mcpTasks: [],
     runCursors: new Map(), // runId -> cursor
     pollTimers: new Map(), // runId -> intervalId
     rawJson: false,
@@ -502,29 +232,6 @@ export function mount({ container, host, slots }) {
     return await host.backend.invoke(method, params);
   };
 
-  const formatCodexItem = (item) => {
-    if (!item || typeof item !== 'object') return '';
-    const t = item.type;
-    if (t === 'command_execution') {
-      const status = item.status ? ` status=${item.status}` : '';
-      const code = item.exit_code !== undefined ? ` exit=${item.exit_code}` : '';
-      return `command ${JSON.stringify(item.command || '')}${status}${code}`;
-    }
-    if (t === 'file_change') {
-      const changes = Array.isArray(item.changes) ? item.changes.map((c) => `${c.kind}:${c.path}`).join(', ') : '';
-      return `patch status=${item.status || ''}${changes ? ` changes=[${changes}]` : ''}`;
-    }
-    if (t === 'mcp_tool_call') {
-      return `mcp ${String(item.server || '')}.${String(item.tool || '')} status=${String(item.status || '')}`;
-    }
-    if (t === 'web_search') return `web_search ${JSON.stringify(item.query || '')}`;
-    if (t === 'todo_list') return `todo_list (${Array.isArray(item.items) ? item.items.length : 0} items)`;
-    if (t === 'error') return `error ${JSON.stringify(item.message || '')}`;
-    if (t === 'reasoning') return `reasoning ${JSON.stringify(String(item.text || '').slice(0, 120))}`;
-    if (t === 'agent_message') return `assistant ${JSON.stringify(String(item.text || '').slice(0, 160))}`;
-    return `${String(t || 'item')} ${JSON.stringify(item).slice(0, 200)}`;
-  };
-
   const formatStoredEvent = (evt) => {
     const ts = evt?.ts || new Date().toISOString();
     if (state.rawJson) return `[${ts}] ${JSON.stringify(evt, null, 2)}`;
@@ -559,213 +266,6 @@ export function mount({ container, host, slots }) {
     }
 
     return `[${ts}] ${JSON.stringify(evt).slice(0, 320)}`;
-  };
-
-  const formatTime = (ts) => {
-    const s = String(ts || '');
-    if (s.length >= 19 && s.includes('T')) return s.slice(11, 19);
-    return s || new Date().toISOString().slice(11, 19);
-  };
-
-  const normalizeText = (value) => String(value ?? '').replace(/\r\n?/g, '\n');
-
-  const truncateText = (value, limit) => {
-    const text = normalizeText(value);
-    if (!text) return { text: '', truncated: false, originalLength: 0 };
-    const max = Number(limit);
-    if (!Number.isFinite(max) || max <= 0 || text.length <= max) {
-      return { text, truncated: false, originalLength: text.length };
-    }
-    const keep = Math.max(0, max - 32);
-    const trimmed = text.slice(0, keep).trimEnd();
-    return { text: `${trimmed}…(truncated, originalLength=${text.length})`, truncated: true, originalLength: text.length };
-  };
-
-  const collapseWhitespace = (value) => normalizeText(value).replace(/\s+/g, ' ').trim();
-
-  const stringifyValue = (value) => {
-    if (value === undefined || value === null) return '';
-    if (typeof value === 'string') return value;
-    try {
-      return JSON.stringify(value, null, 2);
-    } catch {
-      return String(value);
-    }
-  };
-
-  const looksLikeMarkdown = (value) => {
-    const text = normalizeText(value);
-    if (!text) return false;
-    if (text.includes('```')) return true;
-    if (/(^|\n)\s{0,3}#{1,6}\s+\S+/.test(text)) return true;
-    if (/(^|\n)\s*([-*+]|\d+\.)\s+\S+/.test(text)) return true;
-    if (/(^|\n)\|.+\|/.test(text)) return true;
-    return false;
-  };
-
-  const ensureClosedFences = (value) => {
-    const text = normalizeText(value);
-    const matches = text.match(/```/g);
-    if (matches && matches.length % 2 === 1) return `${text}\n\`\`\``;
-    return text;
-  };
-
-  const formatValueForMarkdown = (value, { limit, forceCodeBlock = false, codeLang = '' } = {}) => {
-    const raw = stringifyValue(value);
-    if (!raw) return { markdown: '', preview: '', truncated: false, originalLength: 0 };
-    const trimmed = truncateText(raw, limit);
-    if (forceCodeBlock || typeof value === 'object' || (raw.includes('\n') && !looksLikeMarkdown(raw))) {
-      const lang = codeLang || (typeof value === 'object' ? 'json' : '');
-      const fence = lang ? `\`\`\`${lang}` : '```';
-      return {
-        markdown: `${fence}\n${trimmed.text}\n\`\`\``,
-        preview: trimmed.text,
-        truncated: trimmed.truncated,
-        originalLength: trimmed.originalLength,
-      };
-    }
-    const content = trimmed.truncated ? ensureClosedFences(trimmed.text) : trimmed.text;
-    return { markdown: content, preview: trimmed.text, truncated: trimmed.truncated, originalLength: trimmed.originalLength };
-  };
-
-  const appendBoldNodes = (parent, text) => {
-    if (!text) return;
-    let pos = 0;
-    while (pos < text.length) {
-      const start = text.indexOf('**', pos);
-      if (start === -1) {
-        parent.appendChild(document.createTextNode(text.slice(pos)));
-        return;
-      }
-      const end = text.indexOf('**', start + 2);
-      if (end === -1) {
-        parent.appendChild(document.createTextNode(text.slice(pos)));
-        return;
-      }
-      if (start > pos) parent.appendChild(document.createTextNode(text.slice(pos, start)));
-      const strong = document.createElement('strong');
-      strong.textContent = text.slice(start + 2, end);
-      parent.appendChild(strong);
-      pos = end + 2;
-    }
-  };
-
-  const appendInlineNodes = (parent, text) => {
-    if (!text) return;
-    const parts = text.split('`');
-    parts.forEach((part, idx) => {
-      if (idx % 2 === 1) {
-        const code = document.createElement('code');
-        code.textContent = part;
-        parent.appendChild(code);
-        return;
-      }
-      appendBoldNodes(parent, part);
-    });
-  };
-
-  const renderMarkdown = (markdown) => {
-    const fragment = document.createDocumentFragment();
-    const text = normalizeText(markdown);
-    if (!text) return fragment;
-
-    const lines = text.split('\n');
-    let inCode = false;
-    let codeLines = [];
-    let listEl = null;
-    let listType = '';
-    let paragraph = [];
-
-    const flushParagraph = () => {
-      if (!paragraph.length) return;
-      const p = document.createElement('p');
-      appendInlineNodes(p, paragraph.join('\n'));
-      fragment.appendChild(p);
-      paragraph = [];
-    };
-
-    const flushList = () => {
-      if (!listEl) return;
-      fragment.appendChild(listEl);
-      listEl = null;
-      listType = '';
-    };
-
-    const flushCode = () => {
-      if (!inCode) return;
-      const pre = document.createElement('pre');
-      const code = document.createElement('code');
-      code.textContent = codeLines.join('\n');
-      pre.appendChild(code);
-      fragment.appendChild(pre);
-      codeLines = [];
-      inCode = false;
-    };
-
-    for (const line of lines) {
-      const fenceMatch = line.match(/^```(\w+)?\s*$/);
-      if (fenceMatch) {
-        flushParagraph();
-        flushList();
-        if (inCode) flushCode();
-        else {
-          inCode = true;
-          codeLines = [];
-        }
-        continue;
-      }
-
-      if (inCode) {
-        codeLines.push(line);
-        continue;
-      }
-
-      const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
-      if (headingMatch) {
-        flushParagraph();
-        flushList();
-        const level = Math.min(6, headingMatch[1].length);
-        const h = document.createElement(`h${level}`);
-        appendInlineNodes(h, headingMatch[2]);
-        fragment.appendChild(h);
-        continue;
-      }
-
-      const orderedMatch = line.match(/^\s*(\d+)\.\s+(.*)$/);
-      const unorderedMatch = line.match(/^\s*[-*+]\s+(.*)$/);
-      if (orderedMatch || unorderedMatch) {
-        flushParagraph();
-        const nextType = orderedMatch ? 'ol' : 'ul';
-        if (!listEl || listType !== nextType) {
-          flushList();
-          listType = nextType;
-          listEl = document.createElement(nextType);
-        }
-        const li = document.createElement('li');
-        appendInlineNodes(li, orderedMatch ? orderedMatch[2] : unorderedMatch[1]);
-        listEl.appendChild(li);
-        continue;
-      }
-
-      if (!line.trim()) {
-        flushParagraph();
-        flushList();
-        continue;
-      }
-
-      paragraph.push(line);
-    }
-
-    flushParagraph();
-    flushList();
-    flushCode();
-    return fragment;
-  };
-
-  const clampNumber = (value, min, max) => {
-    const n = Number(value);
-    if (!Number.isFinite(n)) return min;
-    return Math.min(max, Math.max(min, n));
   };
 
   const getEvents = (windowId) => state.windowEvents.get(windowId) || [];
@@ -805,65 +305,6 @@ export function mount({ container, host, slots }) {
   const applyInputDraft = (windowId) => {
     if (!promptInput) return;
     promptInput.value = loadInputDraft(windowId);
-  };
-
-  const normalizeTodoItem = (item) => {
-    if (!item) return null;
-    if (typeof item === 'string') {
-      const text = item.trim();
-      return text ? { text, completed: false } : null;
-    }
-    if (typeof item !== 'object') return null;
-    const text = String(item.text || item.content || item.title || item.name || item.task || item.label || item.value || '').trim();
-    if (!text) return null;
-    const completed = Boolean(item.completed ?? item.done ?? item.checked ?? item.finished ?? item.isDone ?? item.is_done);
-    return { text, completed };
-  };
-
-  const parseTodoMarkdown = (value) => {
-    const text = normalizeText(value).trim();
-    if (!text) return [];
-    const items = [];
-    for (const rawLine of text.split('\n')) {
-      const line = rawLine.trim();
-      if (!line) continue;
-      let match = line.match(/^[-*]\s+\[(x|X| )\]\s+(.*)$/);
-      if (match) {
-        const itemText = String(match[2] || '').trim();
-        if (itemText) items.push({ text: itemText, completed: String(match[1]).toLowerCase() === 'x' });
-        continue;
-      }
-      match = line.match(/^[-*]\s+(.*)$/);
-      if (match) {
-        const itemText = String(match[1] || '').trim();
-        if (itemText) items.push({ text: itemText, completed: false });
-        continue;
-      }
-      match = line.match(/^\d+\.\s+(.*)$/);
-      if (match) {
-        const itemText = String(match[1] || '').trim();
-        if (itemText) items.push({ text: itemText, completed: false });
-      }
-    }
-    return items;
-  };
-
-  const normalizeTodoItems = (value) => {
-    if (Array.isArray(value)) {
-      const mapped = value.map(normalizeTodoItem).filter(Boolean);
-      if (mapped.length) return mapped;
-    }
-    if (typeof value === 'string') return parseTodoMarkdown(value);
-    if (value && typeof value === 'object') {
-      if (Array.isArray(value.items)) {
-        const mapped = value.items.map(normalizeTodoItem).filter(Boolean);
-        return mapped;
-      }
-      const text = value.text || value.content || value.output_text || value.outputText || value.message;
-      const parsed = parseTodoMarkdown(text);
-      if (parsed.length) return parsed;
-    }
-    return [];
   };
 
   const captureTodoFromEvent = (windowId, evt) => {
@@ -1759,6 +1200,92 @@ export function mount({ container, host, slots }) {
     }
   };
 
+  const formatTaskTime = (value) => {
+    if (!value) return '';
+    const ts = Date.parse(String(value));
+    if (!Number.isFinite(ts)) return '';
+    try {
+      return new Date(ts).toLocaleString();
+    } catch {
+      return String(value);
+    }
+  };
+
+  const getTaskStatusLabel = (task) => {
+    const status = String(task?.status || '').toLowerCase();
+    if (status === 'running') return '执行中';
+    if (status === 'completed') return '完成';
+    if (status === 'failed') return '失败';
+    if (status === 'aborted') return '已中止';
+    if (status === 'queued') {
+      return String(task?.windowStatus || '') === 'running' ? '等待当前窗口完成' : '待执行';
+    }
+    return '待执行';
+  };
+
+  const renderTaskList = () => {
+    taskList.textContent = '';
+    const tasks = Array.isArray(state.mcpTasks) ? state.mcpTasks : [];
+    if (!tasks.length) {
+      const empty = el('div', { fontSize: '12px', color: colors.textMuted, padding: '6px 2px' });
+      empty.textContent = '暂无 MCP 任务';
+      taskList.appendChild(empty);
+      return;
+    }
+
+    for (const task of tasks) {
+      const row = el('div', {
+        display: 'grid',
+        gap: '6px',
+        padding: '10px',
+        borderRadius: '12px',
+        border: `1px solid ${colors.border}`,
+        background: colors.bg,
+      });
+
+      const title = el('div', {
+        fontWeight: '700',
+        color: colors.textStrong,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+      });
+      const input = String(task?.input || '').trim();
+      title.textContent = input ? input.slice(0, 36) : task?.id || 'MCP 任务';
+
+      const meta = el('div', {
+        fontSize: '12px',
+        color: colors.textMuted,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+      });
+      const workdir = String(task?.workingDirectory || '').trim();
+      const time = formatTaskTime(task?.createdAt);
+      meta.textContent = [workdir || '未指定目录', time].filter(Boolean).join(' · ');
+
+      const statusRow = el('div', { display: 'flex', alignItems: 'center', gap: '6px' });
+      const statusLabel = getTaskStatusLabel(task);
+      const statusBadge = mkBadge(statusLabel, {
+        fg: statusLabel === '执行中' ? '#f59e0b' : statusLabel === '完成' ? '#22c55e' : statusLabel === '失败' ? '#ef4444' : colors.textMuted,
+        bg: statusLabel === '执行中' ? 'rgba(245,158,11,0.12)' : statusLabel === '完成' ? 'rgba(34,197,94,0.12)' : statusLabel === '失败' ? 'rgba(239,68,68,0.12)' : 'transparent',
+        border: statusLabel === '执行中' ? 'rgba(245,158,11,0.35)' : statusLabel === '完成' ? 'rgba(34,197,94,0.35)' : statusLabel === '失败' ? 'rgba(239,68,68,0.35)' : colors.borderStrong,
+      });
+      statusRow.appendChild(statusBadge);
+
+      if (task?.windowName || task?.windowId) {
+        const winLabel = el('div', { fontSize: '12px', color: colors.textMuted });
+        winLabel.textContent = task.windowName || task.windowId;
+        statusRow.appendChild(winLabel);
+      }
+
+      row.appendChild(title);
+      row.appendChild(meta);
+      row.appendChild(statusRow);
+      taskList.appendChild(row);
+    }
+  };
+
   const stopPolling = (runId) => {
     const id = state.pollTimers.get(runId);
     if (id) clearInterval(id);
@@ -1769,6 +1296,7 @@ export function mount({ container, host, slots }) {
   const startPolling = (runId, windowId) => {
     if (state.pollTimers.has(runId)) return;
     state.runCursors.set(runId, 0);
+    loadMcpTasks();
 
     const tick = async () => {
       try {
@@ -1812,6 +1340,7 @@ export function mount({ container, host, slots }) {
             if (state.selectedWindowId === windowId) updateSelectedHeader();
             renderWindowList();
           }
+          loadMcpTasks();
         }
       } catch (e) {
         appendEvent(windowId, { ts: new Date().toISOString(), source: 'system', kind: 'error', error: { message: e?.message || String(e) } });
@@ -1881,17 +1410,16 @@ export function mount({ container, host, slots }) {
   headerTop.appendChild(headerActions);
 
   const meta = el('div', { fontSize: '12px', color: colors.textMuted });
-  renderMeta = (theme) => {
+  const renderMeta = (theme) => {
     meta.textContent = `${ctx?.pluginId || ''}:${ctx?.appId || ''} · theme=${theme || 'light'} · bridge=${bridgeEnabled ? 'enabled' : 'disabled'}`;
   };
+  setRenderMeta(renderMeta);
 
   header.appendChild(headerTop);
   header.appendChild(meta);
 
-  applyTheme(activeTheme);
-  if (typeof host?.theme?.onChange === 'function') {
-    themeUnsub = host.theme.onChange((theme) => applyTheme(theme));
-  }
+  setRoot(root);
+  themeUnsub = subscribe();
 
   const body = el('div', {
     display: 'grid',
@@ -1927,9 +1455,27 @@ export function mount({ container, host, slots }) {
     overflow: 'auto',
     minHeight: '0',
   });
+  windowList.style.flex = '1 1 0';
+
+  const sidebarDivider = el('div', { height: '1px', background: colors.border });
+
+  const taskListHint = el('div', { fontSize: '12px', color: colors.textMuted });
+  taskListHint.textContent = 'MCP 任务列表（同目录串行）';
+
+  const taskList = el('div', {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+    overflow: 'auto',
+    minHeight: '0',
+  });
+  taskList.style.flex = '1 1 0';
 
   sidebar.appendChild(sidebarHint);
   sidebar.appendChild(windowList);
+  sidebar.appendChild(sidebarDivider);
+  sidebar.appendChild(taskListHint);
+  sidebar.appendChild(taskList);
 
   const main = el('div', {
     border: `1px solid ${colors.border}`,
@@ -2643,6 +2189,83 @@ export function mount({ container, host, slots }) {
     if (state.selectedWindowId === id) scheduleRenderInputs();
   };
 
+  const collectUiPromptRequestIds = async () => {
+    if (!host?.uiPrompts?.read) return new Set();
+    try {
+      const payload = await host.uiPrompts.read();
+      const entries = Array.isArray(payload?.entries) ? payload.entries : [];
+      const ids = new Set();
+      for (const entry of entries) {
+        if (entry?.type === 'ui_prompt' && entry?.action === 'request' && entry?.requestId) {
+          ids.add(String(entry.requestId));
+        }
+      }
+      return ids;
+    } catch {
+      return new Set();
+    }
+  };
+
+  const buildMcpResultPrompt = (task) => {
+    const status = String(task?.status || '').toLowerCase();
+    const statusLabel = status === 'completed' ? '完成' : status === 'failed' ? '失败' : status === 'aborted' ? '已中止' : status;
+    const parts = [];
+    if (task?.input) parts.push(`**任务**：${task.input}`);
+    if (task?.workingDirectory) parts.push(`**目录**：\`${task.workingDirectory}\``);
+    if (task?.windowId) parts.push(`**窗口**：\`${task.windowId}\``);
+    if (statusLabel) parts.push(`**状态**：${statusLabel}`);
+    if (task?.resultText) parts.push(`**输出**：\n\n${task.resultText}`);
+    if (task?.error?.message) parts.push(`**错误**：${task.error.message}`);
+    const markdown = parts.length ? parts.join('\n\n') : '😊';
+    return {
+      kind: 'result',
+      title: '执行结果',
+      message: status === 'completed' ? '任务已完成 😊' : `任务${statusLabel} 😊`,
+      allowCancel: true,
+      markdown,
+    };
+  };
+
+  const maybeSendMcpPrompts = async (tasks) => {
+    if (!host?.uiPrompts?.request) return;
+    const existing = await collectUiPromptRequestIds();
+    for (const task of tasks) {
+      const status = String(task?.status || '').toLowerCase();
+      if (status !== 'completed' && status !== 'failed' && status !== 'aborted') continue;
+      const requestId = task?.promptRequestId || `mcp-task:${task.id}`;
+      if (existing.has(requestId)) {
+        if (!task?.promptSentAt) {
+          try {
+            await invoke('codexMarkMcpTaskPrompt', { taskId: task.id, requestId });
+          } catch {
+            // ignore
+          }
+        }
+        continue;
+      }
+      try {
+        const prompt = buildMcpResultPrompt(task);
+        const res = await host.uiPrompts.request({ requestId, prompt });
+        await invoke('codexMarkMcpTaskPrompt', { taskId: task.id, requestId: res?.requestId || requestId });
+        existing.add(requestId);
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  const loadMcpTasks = async () => {
+    try {
+      const res = await invoke('codexListMcpTasks');
+      if (!res?.ok) return;
+      state.mcpTasks = Array.isArray(res?.tasks) ? res.tasks : [];
+      renderTaskList();
+      await maybeSendMcpPrompts(state.mcpTasks);
+    } catch (e) {
+      // ignore
+    }
+  };
+
   const refresh = async () => {
     if (promptInput && state.selectedWindowId) {
       saveInputDraft(state.selectedWindowId, promptInput.value);
@@ -2697,6 +2320,7 @@ export function mount({ container, host, slots }) {
     await loadWindowLogs(state.selectedWindowId);
     await loadWindowTasks(state.selectedWindowId);
     await loadWindowInputs(state.selectedWindowId);
+    await loadMcpTasks();
     renderLog();
     renderInputHistory();
     renderSideTasks();
@@ -2873,6 +2497,9 @@ export function mount({ container, host, slots }) {
   refresh().catch((e) =>
     appendEvent(state.selectedWindowId, { ts: new Date().toISOString(), source: 'system', kind: 'error', error: { message: e?.message || String(e) } }, { render: false }),
   );
+  mcpTaskTimer = setInterval(() => {
+    loadMcpTasks();
+  }, 2000);
 
   return () => {
     for (const id of state.pollTimers.values()) {
@@ -2883,6 +2510,14 @@ export function mount({ container, host, slots }) {
       }
     }
     state.pollTimers.clear();
+    if (mcpTaskTimer) {
+      try {
+        clearInterval(mcpTaskTimer);
+      } catch {
+        // ignore
+      }
+      mcpTaskTimer = null;
+    }
     if (themeUnsub) {
       try {
         themeUnsub();

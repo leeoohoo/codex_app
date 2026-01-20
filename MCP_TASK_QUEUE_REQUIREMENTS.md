@@ -1,7 +1,7 @@
 # MCP 任务排队 + 运行完成通知 修复需求
 
 ## 目标
-当通过 MCP 发起任务时，如果相同工作目录已有正在运行的窗口，则不再新建窗口，而是把任务加入一个“排队列表”。当该窗口运行结束后，排队任务自动顺序执行。同时，修复“完成后未收到 😊 通知”的问题。
+当通过 MCP 发起任务时，如果相同工作目录已有正在运行的窗口，则不再新建窗口，而是把任务加入一个“排队列表”。当该窗口运行结束后，排队任务自动顺序执行。同时，修复“完成后未在笑脸面板看到结果”的问题（参见 `docs/CHATOS_UI_PROMPTS_PROTOCOL.md`）。
 
 ## 现状梳理（基于代码）
 - MCP server：`plugin/apps/codex_app/mcp-server.mjs`
@@ -43,10 +43,14 @@
   - **按 FIFO** 依次启动。
   - 不依赖用户手动刷新。
 
-### 4) 完成通知（😊）修复
-- MCP `window_run` 在任务完成后，应可靠发送：
-  - `codex_app.window_run.completed`，`result = "😊"`。
-- 队列任务执行完成也要发送完成通知。
+### 4) 笑脸面板完成通知
+- 按新的 UI Prompts 协议写入 `ui-prompts.jsonl`：
+  - 记录为 `type="ui_prompt" + action="request"`。
+  - `prompt.kind="result"`，`title`/`message`/`markdown` 可包含 “😊” 与结果摘要。
+  - `source` 使用 `pluginId:appId`（为空时由宿主补齐）。
+  - `requestId` 需可追踪（建议与 MCP requestId / runId 关联）。
+- 队列任务执行完成也要写入对应的 result prompt。
+- 可保留 `codex_app.window_run.completed` 通知作为兼容，但不作为笑脸面板的唯一入口。
 
 ## 约束 & 数据来源
 - 排队任务数据建议复用现有 `codex_app_requests.v1.json` 的 `startRuns`。
@@ -63,7 +67,10 @@
 ## 验收标准
 1. 同一工作目录同时触发 2 个 MCP 任务：
    - 两个任务都出现在“任务列表”。
-   - 第 1 个状态为“执行中”，第 2 个状态为“排队中/等待当前窗口完成”。\n+2. 第 1 个运行结束后，第 2 个自动开始运行。\n+3. “任务列表”能看到排队任务，且状态随运行切换更新（执行中 → 完成）。\n+4. 每个任务完成后都能收到 `codex_app.window_run.completed` + 😊。
+   - 第 1 个状态为“执行中”，第 2 个状态为“排队中/等待当前窗口完成”。
+2. 第 1 个运行结束后，第 2 个自动开始运行。
+3. “任务列表”能看到排队任务，且状态随运行切换更新（执行中 → 完成）。
+4. 每个任务完成后都会在笑脸面板出现 `kind="result"` 的结果通知。
 
 ## 非目标
 - 不涉及修改 MCP tool schema（仍保持 `prompt` 单参数）。

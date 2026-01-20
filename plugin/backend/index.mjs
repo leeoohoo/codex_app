@@ -1,432 +1,24 @@
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import fs from 'node:fs';
-import { createRequire } from 'node:module';
 import path from 'node:path';
 import readline from 'node:readline';
 
-const nowIso = () => new Date().toISOString();
+import {
+  MAX_EVENT_TEXT_CHARS,
+  MAX_MCP_TASKS,
+  MAX_RUN_EVENTS,
+  MAX_WINDOW_INPUTS,
+  STATE_VERSION,
+  UI_PROMPTS_FILE_NAME,
+} from './lib/constants.mjs';
+import { buildCodexExecArgs, buildWindowsCommandArgs, pickAssistantMessage, truncateResultText } from './lib/codex.mjs';
+import { pickDirectory } from './lib/dialog.mjs';
+import { appendJsonlFile, readJsonFile, writeJsonFileAtomic } from './lib/files.mjs';
+import { findGitRepoRoot, resolveTaskkillPath } from './lib/paths.mjs';
+import { normalizeRequests } from './lib/requests.mjs';
+import { getOrCreateBackendStore } from './lib/store.mjs';
+import { normalizeTodoItems } from './lib/todo.mjs';
+import { clampNumber, makeId, normalizeBoolean, normalizeString, nowIso } from './lib/utils.mjs';
 
-const MAX_RUN_EVENTS = 5000;
-const MAX_EVENT_TEXT_CHARS = 50000;
-const MAX_WINDOW_INPUTS = 500;
-const STATE_VERSION = 1;
-const STATE_FILE_NAME = 'codex_app_state.v1.json';
-const REQUESTS_FILE_NAME = 'codex_app_requests.v1.json';
-
-// Keep in-memory runs/windows across backend hot reloads in dev sandbox (and any other dynamic import reloads).
-// The dev server resets backendInstance on file changes, which would otherwise make `codexPollRun` return "run not found".
-const GLOBAL_BACKEND_STORE = Symbol.for('chatos_ui_apps.codex_app.backend_store.v1');
-
-const makeId = () => {
-  try {
-    return randomUUID();
-  } catch {
-    return `${Date.now().toString(36)}_${Math.random().toString(16).slice(2)}`;
-  }
-};
-
-const normalizeString = (value) => {
-  if (typeof value !== 'string') return '';
-  return String(value || '').trim();
-};
-
-const normalizeStringArray = (value) => {
-  if (!Array.isArray(value)) return [];
-  return value.map((v) => normalizeString(v)).filter(Boolean);
-};
-
-const normalizeBoolean = (value) => {
-  if (value === undefined || value === null) return undefined;
-  return Boolean(value);
-};
-
-const resolveTaskkillPath = () => {
-  const root = normalizeString(process.env?.SystemRoot || process.env?.WINDIR);
-  if (root) {
-    const candidate = path.join(root, 'System32', 'taskkill.exe');
-    try {
-      if (fs.existsSync(candidate)) return candidate;
-    } catch {
-      // ignore
-    }
-  }
-  return 'taskkill';
-};
-
-const normalizeTodoItem = (item) => {
-  if (!item) return null;
-  if (typeof item === 'string') {
-    const text = item.trim();
-    return text ? { text, completed: false } : null;
-  }
-  if (typeof item !== 'object') return null;
-  const text = normalizeString(item.text || item.content || item.title || item.name || item.task || item.label || item.value);
-  if (!text) return null;
-  const completed = Boolean(item.completed ?? item.done ?? item.checked ?? item.finished ?? item.isDone ?? item.is_done);
-  return { text, completed };
-};
-
-const parseTodoMarkdown = (value) => {
-  const text = String(value ?? '').replace(/\r\n?/g, '\n').trim();
-  if (!text) return [];
-  const items = [];
-  for (const rawLine of text.split('\n')) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    let match = line.match(/^[-*]\s+\[(x|X| )\]\s+(.*)$/);
-    if (match) {
-      const itemText = String(match[2] || '').trim();
-      if (itemText) items.push({ text: itemText, completed: String(match[1]).toLowerCase() === 'x' });
-      continue;
-    }
-    match = line.match(/^[-*]\s+(.*)$/);
-    if (match) {
-      const itemText = String(match[1] || '').trim();
-      if (itemText) items.push({ text: itemText, completed: false });
-      continue;
-    }
-    match = line.match(/^\d+\.\s+(.*)$/);
-    if (match) {
-      const itemText = String(match[1] || '').trim();
-      if (itemText) items.push({ text: itemText, completed: false });
-    }
-  }
-  return items;
-};
-
-const normalizeTodoItems = (value) => {
-  if (Array.isArray(value)) {
-    const mapped = value.map(normalizeTodoItem).filter(Boolean);
-    if (mapped.length) return mapped;
-  }
-  if (typeof value === 'string') return parseTodoMarkdown(value);
-  if (value && typeof value === 'object') {
-    if (Array.isArray(value.items)) {
-      const mapped = value.items.map(normalizeTodoItem).filter(Boolean);
-      return mapped;
-    }
-    const text = value.text || value.content || value.output_text || value.outputText || value.message;
-    const parsed = parseTodoMarkdown(text);
-    if (parsed.length) return parsed;
-  }
-  return [];
-};
-
-const pickDirectoryViaElectron = async ({ title, defaultPath } = {}) => {
-  let electron = null;
-  try {
-    electron = await import('electron');
-  } catch {
-    try {
-      const require = createRequire(import.meta.url);
-      electron = require('electron');
-    } catch {
-      return null;
-    }
-  }
-  const api = electron?.default && typeof electron.default === 'object' ? electron.default : electron;
-  const dialog = api?.dialog;
-  if (!dialog || typeof dialog.showOpenDialog !== 'function') return null;
-
-  const BrowserWindow = api?.BrowserWindow;
-  let win = undefined;
-  try {
-    win =
-      (BrowserWindow && typeof BrowserWindow.getFocusedWindow === 'function' && BrowserWindow.getFocusedWindow()) ||
-      (BrowserWindow && typeof BrowserWindow.getAllWindows === 'function' && BrowserWindow.getAllWindows()[0]) ||
-      undefined;
-  } catch {
-    win = undefined;
-  }
-
-  const options = {
-    title: normalizeString(title) || undefined,
-    defaultPath: normalizeString(defaultPath) || undefined,
-    properties: ['openDirectory', 'createDirectory', 'promptToCreate'],
-  };
-  const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options);
-
-  const filePaths = Array.isArray(result?.filePaths) ? result.filePaths : [];
-  const selected = !result?.canceled && filePaths[0] ? String(filePaths[0]) : '';
-  return { canceled: Boolean(result?.canceled || !selected), path: selected };
-};
-
-const pickDirectory = async ({ title, defaultPath } = {}) => {
-  const picked = await pickDirectoryViaElectron({ title, defaultPath });
-  if (picked) return { ok: true, ...picked };
-  return { ok: true, canceled: true, path: '', reason: 'unsupported' };
-};
-
-const clampNumber = (value, min, max) => {
-  if (!Number.isFinite(value)) return min;
-  return Math.min(max, Math.max(min, Math.floor(value)));
-};
-
-const ensureDir = (dir) => {
-  if (!dir) return;
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-  } catch {
-    // ignore
-  }
-};
-
-const readJsonFile = (filePath) => {
-  if (!filePath) return null;
-  try {
-    if (!fs.existsSync(filePath)) return null;
-    const raw = fs.readFileSync(filePath, 'utf8');
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' ? parsed : null;
-  } catch {
-    return null;
-  }
-};
-
-const writeJsonFileAtomic = (filePath, data) => {
-  if (!filePath) return;
-  try {
-    const dir = path.dirname(filePath);
-    ensureDir(dir);
-    const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-    fs.renameSync(tmp, filePath);
-  } catch {
-    // ignore
-  }
-};
-
-const normalizeRequests = (raw) => {
-  const data = raw && typeof raw === 'object' ? { ...raw } : {};
-  if (!Array.isArray(data.createWindows)) data.createWindows = [];
-  if (!Array.isArray(data.startRuns)) data.startRuns = [];
-  data.version = STATE_VERSION;
-  return data;
-};
-
-const findUpwardsDataDir = (startPath, pluginId) => {
-  const raw = normalizeString(startPath);
-  if (!raw) return '';
-  let current = raw;
-  try {
-    current = path.resolve(raw);
-  } catch {
-    current = raw;
-  }
-  for (let i = 0; i < 50; i += 1) {
-    const candidate = path.join(current, '.chatos', 'data', pluginId);
-    try {
-      if (fs.existsSync(candidate)) return candidate;
-    } catch {
-      // ignore
-    }
-    const parent = path.dirname(current);
-    if (!parent || parent === current) break;
-    current = parent;
-  }
-  return '';
-};
-
-const resolveDataDir = (ctx) => {
-  const fromCtx = normalizeString(ctx?.dataDir);
-  if (fromCtx) return fromCtx;
-  const pluginId = normalizeString(ctx?.pluginId) || 'com.leeoohoo.codex_app';
-  const fromCwd = findUpwardsDataDir(process.cwd(), pluginId);
-  if (fromCwd) return fromCwd;
-  const fromPluginDir = normalizeString(ctx?.pluginDir);
-  if (fromPluginDir) {
-    const found = findUpwardsDataDir(fromPluginDir, pluginId);
-    if (found) return found;
-  }
-  return path.join(process.cwd(), '.chatos', 'data', pluginId);
-};
-
-const findGitRepoRoot = (startPath) => {
-  const raw = normalizeString(startPath);
-  if (!raw) return '';
-
-  let current = raw;
-  try {
-    current = path.resolve(raw);
-  } catch {
-    current = raw;
-  }
-
-  try {
-    const stat = fs.statSync(current);
-    if (stat.isFile()) current = path.dirname(current);
-  } catch {
-    // If the path doesn't exist, don't attempt to walk up.
-    return '';
-  }
-
-  for (let i = 0; i < 100; i += 1) {
-    try {
-      if (fs.existsSync(path.join(current, '.git'))) return current;
-    } catch {
-      // ignore
-    }
-
-    const parent = path.dirname(current);
-    if (!parent || parent === current) break;
-    current = parent;
-  }
-
-  return '';
-};
-
-const buildWindowsCommandArgs = (command, args) => {
-  const comspec = normalizeString(process.env?.ComSpec || process.env?.COMSPEC) || 'cmd.exe';
-  return {
-    command: comspec,
-    args: ['/d', '/s', '/c', command, ...(Array.isArray(args) ? args : [])],
-  };
-};
-
-const buildCodexExecArgs = ({ threadId, options }) => {
-  const args = ['exec', '--json'];
-
-  if (options?.model) args.push('--model', String(options.model));
-  if (options?.sandboxMode) args.push('--sandbox', String(options.sandboxMode));
-  if (options?.workingDirectory) args.push('--cd', String(options.workingDirectory));
-
-  const addDirs = normalizeStringArray(options?.additionalDirectories);
-  for (const dir of addDirs) args.push('--add-dir', dir);
-
-  if (options?.skipGitRepoCheck) args.push('--skip-git-repo-check');
-
-  if (options?.modelReasoningEffort) {
-    args.push('--config', `model_reasoning_effort="${String(options.modelReasoningEffort)}"`);
-  }
-  if (options?.experimentalWindowsSandboxEnabled !== undefined) {
-    args.push('--config', `features.experimental_windows_sandbox=${Boolean(options.experimentalWindowsSandboxEnabled)}`);
-  }
-  if (options?.networkAccessEnabled !== undefined) {
-    args.push('--config', `sandbox_workspace_write.network_access=${Boolean(options.networkAccessEnabled)}`);
-  }
-  if (options?.webSearchEnabled !== undefined) {
-    args.push('--config', `features.web_search_request=${Boolean(options.webSearchEnabled)}`);
-  }
-  if (options?.approvalPolicy) {
-    args.push('--config', `approval_policy="${String(options.approvalPolicy)}"`);
-  }
-
-  if (threadId) args.push('resume', threadId);
-
-  return args;
-};
-
-const formatCodexItem = (item) => {
-  if (!item || typeof item !== 'object') return '';
-  const t = item.type;
-  if (t === 'command_execution') {
-    const status = item.status ? ` status=${item.status}` : '';
-    const code = item.exit_code !== undefined ? ` exit=${item.exit_code}` : '';
-    return `command ${JSON.stringify(item.command || '')}${status}${code}`;
-  }
-  if (t === 'file_change') {
-    const changes = Array.isArray(item.changes) ? item.changes.map((c) => `${c.kind}:${c.path}`).join(', ') : '';
-    return `patch status=${item.status || ''}${changes ? ` changes=[${changes}]` : ''}`;
-  }
-  if (t === 'mcp_tool_call') {
-    return `mcp ${String(item.server || '')}.${String(item.tool || '')} status=${String(item.status || '')}`;
-  }
-  if (t === 'web_search') return `web_search ${JSON.stringify(item.query || '')}`;
-  if (t === 'todo_list') return `todo_list (${Array.isArray(item.items) ? item.items.length : 0} items)`;
-  if (t === 'error') return `error ${JSON.stringify(item.message || '')}`;
-  if (t === 'reasoning') return `reasoning ${JSON.stringify(String(item.text || '').slice(0, 120))}`;
-  if (t === 'agent_message') return `assistant ${JSON.stringify(String(item.text || '').slice(0, 160))}`;
-  return `${String(t || 'item')} ${JSON.stringify(item).slice(0, 200)}`;
-};
-
-const formatRunEvent = (evt) => {
-  const ts = evt?.ts || nowIso();
-  const trunc = evt?.truncated ? ` …(truncated, originalLength=${Number(evt.originalLength) || 0})` : '';
-
-  if (evt?.source === 'stderr') return `[${ts}] stderr ${String(evt.text || '').trimEnd()}${trunc}`;
-  if (evt?.source === 'raw') return `[${ts}] raw ${String(evt.text || '').trimEnd()}${trunc}`;
-
-  if (evt?.source === 'system') {
-    if (evt.kind === 'spawn') return `[${ts}] spawn ${String(evt.command || '')} ${Array.isArray(evt.args) ? evt.args.join(' ') : ''}`;
-    if (evt.kind === 'status') return `[${ts}] status ${String(evt.status || '')}`;
-    if (evt.kind === 'warning') return `[${ts}] warning ${String(evt.message || evt.warning || '')}`;
-    if (evt.kind === 'error') return `[${ts}] error ${String(evt?.error?.message || '')}`;
-    if (evt.kind === 'gap' && evt?.gap && Number.isFinite(evt.gap?.from) && Number.isFinite(evt.gap?.to)) {
-      return `[${ts}] gap dropped_events seq=[${evt.gap.from}, ${evt.gap.to})`;
-    }
-    return `[${ts}] system ${JSON.stringify(evt).slice(0, 320)}`;
-  }
-
-  if (evt?.source === 'codex') {
-    const e = evt.event || {};
-    if (e.type === 'thread.started') return `[${ts}] thread.started threadId=${String(e.thread_id || '')}`;
-    if (e.type === 'turn.started') return `[${ts}] turn.started`;
-    if (e.type === 'turn.completed') return `[${ts}] turn.completed usage=${JSON.stringify(e.usage || null)}`;
-    if (e.type === 'turn.failed') return `[${ts}] turn.failed ${String(e?.error?.message || '')}`;
-    if (e.type === 'error') return `[${ts}] error ${String(e.message || '')}`;
-    if (e.type === 'item.started') return `[${ts}] item.started ${formatCodexItem(e.item)}`;
-    if (e.type === 'item.updated') return `[${ts}] item.updated ${formatCodexItem(e.item)}`;
-    if (e.type === 'item.completed') return `[${ts}] item.completed ${formatCodexItem(e.item)}`;
-    return `[${ts}] ${String(e.type || 'event')} ${JSON.stringify(e).slice(0, 320)}`;
-  }
-
-  return `[${ts}] ${JSON.stringify(evt).slice(0, 320)}`;
-};
-
-const getGlobalBackendRoot = () => {
-  const existing = globalThis?.[GLOBAL_BACKEND_STORE];
-  if (existing && typeof existing === 'object' && existing.stores instanceof Map) return existing;
-  const root = { stores: new Map() };
-  try {
-    Object.defineProperty(globalThis, GLOBAL_BACKEND_STORE, {
-      value: root,
-      enumerable: false,
-      configurable: false,
-      writable: false,
-    });
-  } catch {
-    // Fallback if defineProperty fails (should be rare).
-    globalThis[GLOBAL_BACKEND_STORE] = root;
-  }
-  return root;
-};
-
-const getOrCreateBackendStore = (ctx) => {
-  const dataDir = resolveDataDir(ctx);
-  ensureDir(dataDir);
-
-  const stateFile = dataDir ? path.join(dataDir, STATE_FILE_NAME) : '';
-  const requestsFile = dataDir ? path.join(dataDir, REQUESTS_FILE_NAME) : '';
-  const key = stateFile || requestsFile || `cwd:${process.cwd()}`;
-
-  const root = getGlobalBackendRoot();
-  let store = root.stores.get(key);
-  if (!store) {
-    store = {
-      key,
-      refCount: 0,
-      dataDir,
-      stateFile,
-      requestsFile,
-      windows: new Map(),
-      runs: new Map(),
-      windowLogs: new Map(),
-      windowInputs: new Map(),
-      stateWriteTimer: null,
-      restored: false,
-    };
-    root.stores.set(key, store);
-  } else {
-    // Best-effort fill when a reload provides a more complete ctx.
-    if (!store.dataDir && dataDir) store.dataDir = dataDir;
-    if (!store.stateFile && stateFile) store.stateFile = stateFile;
-    if (!store.requestsFile && requestsFile) store.requestsFile = requestsFile;
-  }
-
-  return store;
-};
 
 export async function createUiAppsBackend(ctx) {
   const store = getOrCreateBackendStore(ctx);
@@ -436,7 +28,9 @@ export async function createUiAppsBackend(ctx) {
   const runs = store.runs; // runId -> { id, windowId, status, startedAt, finishedAt, events: [], error, abortController }
   const windowLogs = store.windowLogs; // windowId -> { events: object[], lines: string[], updatedAt }
   const windowInputs = store.windowInputs; // windowId -> { items: { ts, text }[], updatedAt }
+  const mcpTasks = store.mcpTasks; // requestId -> task
 
+  const stateDir = store.stateDir || '';
   const stateFile = store.stateFile || '';
   const requestsFile = store.requestsFile || '';
 
@@ -463,6 +57,184 @@ export async function createUiAppsBackend(ctx) {
       if (value !== undefined) merged[key] = value;
     }
     return merged;
+  };
+
+  const normalizeMcpTaskStatus = (value) => {
+    const status = normalizeString(value).toLowerCase();
+    if (status === 'running' || status === 'completed' || status === 'failed' || status === 'aborted') return status;
+    return 'queued';
+  };
+
+  const normalizeMcpTask = (raw) => {
+    if (!raw || typeof raw !== 'object') return null;
+    const id = normalizeString(raw.id);
+    if (!id) return null;
+    return {
+      id,
+      source: normalizeString(raw.source) || 'mcp',
+      status: normalizeMcpTaskStatus(raw.status),
+      input: normalizeString(raw.input),
+      workingDirectory: normalizeString(raw.workingDirectory),
+      windowId: normalizeString(raw.windowId),
+      runId: normalizeString(raw.runId),
+      createdAt: normalizeString(raw.createdAt),
+      startedAt: normalizeString(raw.startedAt),
+      finishedAt: normalizeString(raw.finishedAt),
+      error: raw?.error && typeof raw.error === 'object' ? { message: normalizeString(raw.error.message) } : null,
+      promptRequestId: normalizeString(raw.promptRequestId),
+      promptSentAt: normalizeString(raw.promptSentAt),
+      resultText: normalizeString(raw.resultText),
+      resultStatus: normalizeMcpTaskStatus(raw.resultStatus),
+      resultAt: normalizeString(raw.resultAt),
+    };
+  };
+
+  const pruneMcpTasks = () => {
+    if (mcpTasks.size <= MAX_MCP_TASKS) return;
+    const list = Array.from(mcpTasks.values());
+    list.sort((a, b) => {
+      const aTs = Date.parse(a.createdAt || '') || 0;
+      const bTs = Date.parse(b.createdAt || '') || 0;
+      return aTs - bTs;
+    });
+    const removable = list.filter((item) => item.status === 'completed' || item.status === 'failed' || item.status === 'aborted');
+    const drop = [];
+    for (const item of removable) {
+      if (mcpTasks.size - drop.length <= MAX_MCP_TASKS) break;
+      drop.push(item.id);
+    }
+    for (const id of drop) mcpTasks.delete(id);
+    if (mcpTasks.size <= MAX_MCP_TASKS) return;
+    const still = Array.from(mcpTasks.values()).sort((a, b) => {
+      const aTs = Date.parse(a.createdAt || '') || 0;
+      const bTs = Date.parse(b.createdAt || '') || 0;
+      return aTs - bTs;
+    });
+    for (const item of still) {
+      if (mcpTasks.size <= MAX_MCP_TASKS) break;
+      mcpTasks.delete(item.id);
+    }
+  };
+
+  const registerMcpTask = (req) => {
+    const source = normalizeString(req?.source);
+    if (source && source !== 'mcp') return null;
+    const id = normalizeString(req?.id);
+    if (!id) return null;
+    const existing = mcpTasks.get(id);
+    if (existing) {
+      if (!existing.input) existing.input = normalizeString(req?.input ?? req?.prompt);
+      if (!existing.workingDirectory) {
+        existing.workingDirectory = normalizeString(req?.options?.workingDirectory || req?.defaults?.workingDirectory);
+      }
+      if (!existing.windowId) existing.windowId = normalizeString(req?.windowId);
+      if (!existing.createdAt) existing.createdAt = normalizeString(req?.createdAt) || nowIso();
+      existing.source = existing.source || 'mcp';
+      return existing;
+    }
+
+    const task = {
+      id,
+      source: 'mcp',
+      status: 'queued',
+      input: normalizeString(req?.input ?? req?.prompt),
+      workingDirectory: normalizeString(req?.options?.workingDirectory || req?.defaults?.workingDirectory),
+      windowId: normalizeString(req?.windowId),
+      runId: '',
+      createdAt: normalizeString(req?.createdAt) || nowIso(),
+      startedAt: '',
+      finishedAt: '',
+      error: null,
+      promptRequestId: `mcp-task:${id}`,
+      promptSentAt: '',
+    };
+    mcpTasks.set(id, task);
+    pruneMcpTasks();
+    scheduleStateWrite();
+    return task;
+  };
+
+  const markMcpTaskRunning = (taskId, runId, windowId) => {
+    if (!taskId) return null;
+    const task = mcpTasks.get(taskId);
+    if (!task) return null;
+    task.status = 'running';
+    task.runId = normalizeString(runId);
+    task.windowId = normalizeString(windowId) || task.windowId;
+    if (!task.startedAt) task.startedAt = nowIso();
+    task.error = null;
+    scheduleStateWrite();
+    return task;
+  };
+
+  const markMcpTaskFinished = (taskId, status, error) => {
+    if (!taskId) return null;
+    const task = mcpTasks.get(taskId);
+    if (!task) return null;
+    task.status = normalizeMcpTaskStatus(status);
+    task.finishedAt = nowIso();
+    if (error) {
+      task.error = { message: normalizeString(error?.message || String(error)) };
+    }
+    scheduleStateWrite();
+    return task;
+  };
+
+  const applyMcpTaskResult = (task, run) => {
+    if (!task) return;
+    task.resultStatus = normalizeMcpTaskStatus(run?.status || task.status);
+    task.resultText = truncateResultText(pickAssistantMessage(run));
+    task.resultAt = nowIso();
+    scheduleStateWrite();
+  };
+
+  const writeMcpTaskResultPrompt = (task, run) => {
+    if (!task || task.promptSentAt) return;
+    const runStatus = normalizeMcpTaskStatus(run?.status || task.status);
+    const statusLabel =
+      runStatus === 'completed'
+        ? '完成'
+        : runStatus === 'failed'
+          ? '失败'
+          : runStatus === 'aborted'
+            ? '已中止'
+            : runStatus;
+    const parts = [];
+    if (task.input) parts.push(`**任务**：${task.input}`);
+    if (task.workingDirectory) parts.push(`**目录**：\`${task.workingDirectory}\``);
+    if (task.windowId) parts.push(`**窗口**：\`${task.windowId}\``);
+    if (runStatus) parts.push(`**状态**：${statusLabel}`);
+    const outputText = truncateResultText(pickAssistantMessage(run));
+    if (outputText) parts.push(`**输出**：\n\n${outputText}`);
+    const errorMessage = task.error?.message || run?.error?.message;
+    if (errorMessage) parts.push(`**错误**：${errorMessage}`);
+    const markdown = parts.length ? parts.join('\n\n') : '😊';
+
+    const pluginId = normalizeString(run?.pluginId || ctx?.pluginId);
+    const appId = normalizeString(run?.appId || ctx?.appId || 'codex_app');
+    const source = pluginId ? (appId ? `${pluginId}:${appId}` : pluginId) : '';
+    const requestId = task.promptRequestId || `mcp-task:${task.id}`;
+    const entry = {
+      ts: nowIso(),
+      type: 'ui_prompt',
+      action: 'request',
+      requestId,
+      runId: normalizeString(run?.id || task.runId) || undefined,
+      prompt: {
+        kind: 'result',
+        title: '执行结果',
+        message: runStatus === 'completed' ? '任务已完成 😊' : `任务${statusLabel} 😊`,
+        ...(source ? { source } : {}),
+        allowCancel: true,
+        markdown,
+      },
+    };
+    const promptRoot = stateDir || (stateFile ? path.dirname(stateFile) : '');
+    const promptFile = promptRoot ? path.join(promptRoot, UI_PROMPTS_FILE_NAME) : '';
+    appendJsonlFile(promptFile, entry);
+    task.promptSentAt = nowIso();
+    task.promptRequestId = requestId;
+    scheduleStateWrite();
   };
 
   const serializeRunOptions = (options) => {
@@ -563,12 +335,23 @@ export async function createUiAppsBackend(ctx) {
     }
   };
 
+  const restoreMcpTasksFromState = (snapshot) => {
+    const list = Array.isArray(snapshot?.mcpTasks) ? snapshot.mcpTasks : [];
+    for (const raw of list) {
+      const task = normalizeMcpTask(raw);
+      if (!task) continue;
+      mcpTasks.set(task.id, task);
+    }
+    pruneMcpTasks();
+  };
+
   const restoreState = () => {
     const snapshot = loadStateFile();
     if (!snapshot) return;
     restoreWindowsFromState(snapshot);
     restoreWindowLogsFromState(snapshot);
     restoreWindowInputsFromState(snapshot);
+    restoreMcpTasksFromState(snapshot);
   };
 
   const appendWindowLog = (windowId, evt) => {
@@ -623,6 +406,25 @@ export async function createUiAppsBackend(ctx) {
       };
     }
 
+    const mcpTaskSnapshot = Array.from(mcpTasks.values()).map((task) => ({
+      id: task.id,
+      source: task.source || 'mcp',
+      status: task.status,
+      input: task.input,
+      workingDirectory: task.workingDirectory,
+      windowId: task.windowId,
+      runId: task.runId,
+      createdAt: task.createdAt,
+      startedAt: task.startedAt,
+      finishedAt: task.finishedAt,
+      error: task.error,
+      promptRequestId: task.promptRequestId,
+      promptSentAt: task.promptSentAt,
+      resultText: task.resultText,
+      resultStatus: task.resultStatus,
+      resultAt: task.resultAt,
+    }));
+
     return {
       version: STATE_VERSION,
       updatedAt: nowIso(),
@@ -651,6 +453,7 @@ export async function createUiAppsBackend(ctx) {
       windowLogs: logSnapshot,
       windowTasks,
       windowInputs: inputSnapshot,
+      mcpTasks: mcpTaskSnapshot,
     };
   };
 
@@ -696,6 +499,7 @@ export async function createUiAppsBackend(ctx) {
       const input = normalizeString(req?.input ?? req?.prompt);
       if (!input) continue;
 
+      const task = registerMcpTask(req);
       const ensureWindow = req?.ensureWindow === undefined ? true : Boolean(req.ensureWindow);
       const windowId = normalizeString(req?.windowId);
       const windowName = normalizeString(req?.windowName);
@@ -718,21 +522,30 @@ export async function createUiAppsBackend(ctx) {
       }
       if (window.status === 'running' || window.status === 'aborting') {
         pendingRuns.push(req);
+        if (task) {
+          task.status = 'queued';
+          task.windowId = window.id;
+          scheduleStateWrite();
+        }
         continue;
       }
 
       appendWindowInput(window.id, input);
 
-      await startRun(
+      const started = await startRun(
         {
           windowId: window.id,
           input,
           codexCommand,
           options,
           threadId,
+          mcpTaskId: task?.id || '',
         },
         runtimeCtx,
       );
+      if (task && started?.run?.id) {
+        markMcpTaskRunning(task.id, started.run.id, window.id);
+      }
     }
 
     writeJsonFileAtomic(requestsFile, {
@@ -898,6 +711,7 @@ export async function createUiAppsBackend(ctx) {
     const rawOptions = params?.options && typeof params.options === 'object' ? params.options : {};
     const options = mergeRunOptions(window.defaultRunOptions, rawOptions);
     const threadId = normalizeString(params?.threadId) || normalizeString(window.threadId);
+    const mcpTaskId = normalizeString(params?.mcpTaskId);
 
     const runId = makeId();
     const startedAt = nowIso();
@@ -916,6 +730,8 @@ export async function createUiAppsBackend(ctx) {
       options,
       threadId,
       pluginId: runtimeCtx?.pluginId || ctx?.pluginId || '',
+      appId: runtimeCtx?.appId || ctx?.appId || 'codex_app',
+      mcpTaskId,
       childPid: 0,
       nextSeq: 0,
         droppedEvents: 0,
@@ -998,6 +814,17 @@ export async function createUiAppsBackend(ctx) {
         win.updatedAt = run.finishedAt;
       }
       scheduleStateWrite();
+      if (run.mcpTaskId) {
+        const task = markMcpTaskFinished(run.mcpTaskId, status, run.error);
+        if (task) applyMcpTaskResult(task, run);
+      }
+      if (requestsFile) {
+        setTimeout(() => {
+          syncRequests(runtimeCtx).catch(() => {
+            // ignore
+          });
+        }, 0);
+      }
     };
 
     const exitPromise = new Promise((resolve) => {
@@ -1228,6 +1055,51 @@ export async function createUiAppsBackend(ctx) {
           items: Array.isArray(entry.items) ? entry.items : [],
           updatedAt: entry.updatedAt || '',
         };
+      },
+
+      async codexListMcpTasks(_params, runtimeCtx) {
+        await syncRequests(runtimeCtx);
+        const list = Array.from(mcpTasks.values()).map((task) => {
+          const win = task.windowId ? windows.get(task.windowId) : null;
+          return {
+            id: task.id,
+            source: task.source || 'mcp',
+            status: task.status,
+            input: task.input,
+            workingDirectory: task.workingDirectory,
+            windowId: task.windowId,
+            windowName: win?.name || '',
+            windowStatus: win?.status || '',
+            runId: task.runId,
+            createdAt: task.createdAt,
+            startedAt: task.startedAt,
+            finishedAt: task.finishedAt,
+            error: task.error,
+            promptRequestId: task.promptRequestId,
+            promptSentAt: task.promptSentAt,
+            resultText: task.resultText,
+            resultStatus: task.resultStatus,
+            resultAt: task.resultAt,
+          };
+        });
+        list.sort((a, b) => {
+          const aTs = Date.parse(a.createdAt || '') || 0;
+          const bTs = Date.parse(b.createdAt || '') || 0;
+          return bTs - aTs;
+        });
+        return { ok: true, tasks: list };
+      },
+
+      async codexMarkMcpTaskPrompt(params) {
+        const id = normalizeString(params?.taskId);
+        if (!id) throw new Error('taskId is required');
+        const task = mcpTasks.get(id);
+        if (!task) throw new Error(`mcp task not found: ${id}`);
+        const requestId = normalizeString(params?.requestId);
+        if (requestId) task.promptRequestId = requestId;
+        task.promptSentAt = nowIso();
+        scheduleStateWrite();
+        return { ok: true, taskId: id, requestId: task.promptRequestId };
       },
 
       async codexAppendWindowInput(params, runtimeCtx) {

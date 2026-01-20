@@ -1,9 +1,7 @@
 // plugin/apps/codex_app/mcp-server.mjs
-import { randomUUID } from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import readline from "node:readline";
-import { fileURLToPath } from "node:url";
+
+// plugin/apps/codex_app/mcp/constants.mjs
 var MCP_PROTOCOL_VERSION = "2024-11-05";
 var PLUGIN_ID = "com.leeoohoo.codex_app";
 var STATE_VERSION = 1;
@@ -13,20 +11,10 @@ var DEFAULT_MODEL = "gpt-5.2-codex";
 var DEFAULT_APPROVAL = "never";
 var COMPLETION_POLL_MS = 1e3;
 var COMPLETION_TIMEOUT_MS = 30 * 60 * 1e3;
-var scriptDir = path.dirname(fileURLToPath(import.meta.url));
-var pluginRoot = path.resolve(scriptDir, "..", "..", "..");
-var normalizeString = (value) => {
-  if (typeof value !== "string") return "";
-  return String(value || "").trim();
-};
-var nowIso = () => (/* @__PURE__ */ new Date()).toISOString();
-var makeId = () => {
-  try {
-    return randomUUID();
-  } catch {
-    return `${Date.now().toString(36)}_${Math.random().toString(16).slice(2)}`;
-  }
-};
+
+// plugin/apps/codex_app/mcp/files.mjs
+import fs from "node:fs";
+import path from "node:path";
 var ensureDir = (dir) => {
   if (!dir) return;
   try {
@@ -62,22 +50,50 @@ var writeJsonFileAtomic = (filePath, data) => {
     }
   }
 };
+
+// plugin/apps/codex_app/mcp/paths.mjs
+import fs2 from "node:fs";
+import path2 from "node:path";
+import { fileURLToPath } from "node:url";
+
+// plugin/apps/codex_app/mcp/utils.mjs
+import { randomUUID } from "node:crypto";
+var normalizeString = (value) => {
+  if (typeof value !== "string") return "";
+  return String(value || "").trim();
+};
+var nowIso = () => (/* @__PURE__ */ new Date()).toISOString();
+var makeId = () => {
+  try {
+    return randomUUID();
+  } catch {
+    return `${Date.now().toString(36)}_${Math.random().toString(16).slice(2)}`;
+  }
+};
+var parseIsoTime = (value) => {
+  const ts = Date.parse(value || "");
+  return Number.isFinite(ts) ? ts : 0;
+};
+
+// plugin/apps/codex_app/mcp/paths.mjs
+var scriptDir = path2.dirname(fileURLToPath(import.meta.url));
+var pluginRoot = path2.resolve(scriptDir, "..", "..", "..");
 var findUpwardsDataDir = (startPath, pluginId) => {
   const raw = normalizeString(startPath);
   if (!raw) return "";
   let current = raw;
   try {
-    current = path.resolve(raw);
+    current = path2.resolve(raw);
   } catch {
     current = raw;
   }
   for (let i = 0; i < 50; i += 1) {
-    const candidate = path.join(current, ".chatos", "data", pluginId);
+    const candidate = path2.join(current, ".chatos", "data", pluginId);
     try {
-      if (fs.existsSync(candidate)) return candidate;
+      if (fs2.existsSync(candidate)) return candidate;
     } catch {
     }
-    const parent = path.dirname(current);
+    const parent = path2.dirname(current);
     if (!parent || parent === current) break;
     current = parent;
   }
@@ -88,22 +104,22 @@ var findGitRepoRoot = (startPath) => {
   if (!raw) return "";
   let current = raw;
   try {
-    current = path.resolve(raw);
+    current = path2.resolve(raw);
   } catch {
     current = raw;
   }
   try {
-    const stat = fs.statSync(current);
-    if (stat.isFile()) current = path.dirname(current);
+    const stat = fs2.statSync(current);
+    if (stat.isFile()) current = path2.dirname(current);
   } catch {
     return "";
   }
   for (let i = 0; i < 100; i += 1) {
     try {
-      if (fs.existsSync(path.join(current, ".git"))) return current;
+      if (fs2.existsSync(path2.join(current, ".git"))) return current;
     } catch {
     }
-    const parent = path.dirname(current);
+    const parent = path2.dirname(current);
     if (!parent || parent === current) break;
     current = parent;
   }
@@ -112,18 +128,18 @@ var findGitRepoRoot = (startPath) => {
 var resolveDataDirFromStateDir = (stateDir) => {
   const raw = normalizeString(stateDir);
   if (!raw) return "";
-  return path.join(raw, "ui_apps", "data", PLUGIN_ID);
+  return path2.join(raw, "ui_apps", "data", PLUGIN_ID);
 };
 var looksLikeDataDir = (value) => {
   const raw = normalizeString(value);
   if (!raw) return false;
   let resolved = raw;
   try {
-    resolved = path.resolve(raw);
+    resolved = path2.resolve(raw);
   } catch {
     resolved = raw;
   }
-  const normalized = resolved.split(path.sep).join("/");
+  const normalized = resolved.split(path2.sep).join("/");
   return normalized.endsWith(`/ui_apps/data/${PLUGIN_ID}`) || normalized.endsWith(`/.chatos/data/${PLUGIN_ID}`);
 };
 var resolveStateDirFromEnv = () => {
@@ -134,7 +150,7 @@ var resolveStateDirFromEnv = () => {
   const home = normalizeString(process.env?.HOME || process.env?.USERPROFILE);
   const base = sessionRoot || home;
   if (!base) return "";
-  return path.join(base, ".deepseek_cli", hostApp);
+  return path2.join(base, ".deepseek_cli", hostApp);
 };
 var resolveDataDirFromEnv = () => resolveDataDirFromStateDir(resolveStateDirFromEnv());
 var resolveDataDir = () => {
@@ -146,7 +162,7 @@ var resolveDataDir = () => {
   if (fromCwd) return fromCwd;
   const fromPlugin = findUpwardsDataDir(pluginRoot, PLUGIN_ID);
   if (fromPlugin) return fromPlugin;
-  return path.join(process.cwd(), ".chatos", "data", PLUGIN_ID);
+  return path2.join(process.cwd(), ".chatos", "data", PLUGIN_ID);
 };
 var resolveDataDirFromMeta = (meta) => {
   const fromUiApp = normalizeString(meta?.chatos?.uiApp?.dataDir);
@@ -169,12 +185,29 @@ var resolveDefaultWorkingDirectory = (meta) => {
 };
 var getStateFile = (meta) => {
   const dataDir = resolveDataDirWithMeta(meta);
-  return dataDir ? path.join(dataDir, STATE_FILE_NAME) : "";
+  return dataDir ? path2.join(dataDir, STATE_FILE_NAME) : "";
 };
 var getRequestsFile = (meta) => {
   const dataDir = resolveDataDirWithMeta(meta);
-  return dataDir ? path.join(dataDir, REQUESTS_FILE_NAME) : "";
+  return dataDir ? path2.join(dataDir, REQUESTS_FILE_NAME) : "";
 };
+
+// plugin/apps/codex_app/mcp/requests.mjs
+var normalizeRequests = (raw) => {
+  const data = raw && typeof raw === "object" ? { ...raw } : {};
+  if (!Array.isArray(data.createWindows)) data.createWindows = [];
+  if (!Array.isArray(data.startRuns)) data.startRuns = [];
+  data.version = STATE_VERSION;
+  return data;
+};
+var appendStartRunRequest = (entry, meta) => {
+  const requestsFile = getRequestsFile(meta);
+  const requests = normalizeRequests(readJsonFile(requestsFile));
+  requests.startRuns.push(entry);
+  writeJsonFileAtomic(requestsFile, requests);
+};
+
+// plugin/apps/codex_app/mcp/rpc.mjs
 var send = (msg) => {
   try {
     process.stdout.write(`${JSON.stringify(msg)}
@@ -201,10 +234,12 @@ var jsonRpcError = (id, code, message, data) => ({
   }
 });
 var jsonRpcResult = (id, result) => ({ jsonrpc: "2.0", id, result });
-var parseIsoTime = (value) => {
-  const ts = Date.parse(value || "");
-  return Number.isFinite(ts) ? ts : 0;
-};
+var toolResultText = (text) => ({
+  content: [{ type: "text", text: String(text ?? "") }]
+});
+
+// plugin/apps/codex_app/mcp/windows.mjs
+import path3 from "node:path";
 var parseWindowTime = (win) => {
   const updated = Date.parse(win?.updatedAt || "") || 0;
   if (updated) return updated;
@@ -219,7 +254,7 @@ var normalizePath = (value) => {
   const raw = normalizeString(value);
   if (!raw) return "";
   try {
-    return path.resolve(raw);
+    return path3.resolve(raw);
   } catch {
     return raw;
   }
@@ -234,9 +269,8 @@ var findWindowByWorkingDirectory = (windows, workingDirectory, { includeRunning 
     return workdir && workdir === needle;
   }) : null;
 };
-var toolResultText = (text) => ({
-  content: [{ type: "text", text: String(text ?? "") }]
-});
+
+// plugin/apps/codex_app/mcp-server.mjs
 var loadState = (meta) => readJsonFile(getStateFile(meta)) || { version: 0, windows: [], windowLogs: {}, windowTasks: {} };
 var buildDefaultsApplied = (input, meta) => {
   const workingDirectory = normalizeString(input?.workingDirectory) || resolveDefaultWorkingDirectory(meta);
@@ -268,19 +302,6 @@ var mergeRunOptionsForRequest = (base, override) => {
     }
   }
   return merged;
-};
-var normalizeRequests = (raw) => {
-  const data = raw && typeof raw === "object" ? { ...raw } : {};
-  if (!Array.isArray(data.createWindows)) data.createWindows = [];
-  if (!Array.isArray(data.startRuns)) data.startRuns = [];
-  data.version = STATE_VERSION;
-  return data;
-};
-var appendStartRunRequest = (entry, meta) => {
-  const requestsFile = getRequestsFile(meta);
-  const requests = normalizeRequests(readJsonFile(requestsFile));
-  requests.startRuns.push(entry);
-  writeJsonFileAtomic(requestsFile, requests);
 };
 var pendingCompletions = /* @__PURE__ */ new Map();
 var clearCompletionWatcher = (token) => {
@@ -389,7 +410,7 @@ var handleRequest = async (req) => {
       const windows = sortWindowsByRecent(Array.isArray(state?.windows) ? state.windows : []);
       const defaultsApplied = buildDefaultsApplied({}, meta);
       const workingDirectory = normalizeString(defaultsApplied.workingDirectory);
-      const windowByWorkdir = findWindowByWorkingDirectory(windows, workingDirectory);
+      const windowByWorkdir = findWindowByWorkingDirectory(windows, workingDirectory, { includeRunning: true });
       const baseOptions = windowByWorkdir?.defaultRunOptions || windowByWorkdir?.lastRunOptions || {};
       const runOptions = mergeRunOptionsForRequest(defaultsApplied, baseOptions);
       if (workingDirectory) runOptions.workingDirectory = workingDirectory;
@@ -405,6 +426,7 @@ var handleRequest = async (req) => {
       appendStartRunRequest(
         {
           id: requestId,
+          source: "mcp",
           windowId: targetWindowId,
           windowName: "",
           ensureWindow: true,

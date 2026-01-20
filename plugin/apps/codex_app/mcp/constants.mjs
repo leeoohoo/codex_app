@@ -1,0 +1,9 @@
+export const MCP_PROTOCOL_VERSION = '2024-11-05';
+export const PLUGIN_ID = 'com.leeoohoo.codex_app';
+export const STATE_VERSION = 1;
+export const STATE_FILE_NAME = 'codex_app_state.v1.json';
+export const REQUESTS_FILE_NAME = 'codex_app_requests.v1.json';
+export const DEFAULT_MODEL = 'gpt-5.2-codex';
+export const DEFAULT_APPROVAL = 'never';
+export const COMPLETION_POLL_MS = 1000;
+export const COMPLETION_TIMEOUT_MS = 30 * 60 * 1000;

@@ -4,286 +4,24 @@
  * 注意：ChatOS 导入插件包时会默认排除 `node_modules/`，因此这里仅使用 Node.js 内置模块。
  */
 
-import { randomUUID } from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
 import readline from 'node:readline';
-import { fileURLToPath } from 'node:url';
-
-const MCP_PROTOCOL_VERSION = '2024-11-05';
-const PLUGIN_ID = 'com.leeoohoo.codex_app';
-const STATE_VERSION = 1;
-const STATE_FILE_NAME = 'codex_app_state.v1.json';
-const REQUESTS_FILE_NAME = 'codex_app_requests.v1.json';
-const DEFAULT_MODEL = 'gpt-5.2-codex';
-const DEFAULT_APPROVAL = 'never';
-const COMPLETION_POLL_MS = 1000;
-const COMPLETION_TIMEOUT_MS = 30 * 60 * 1000;
-
-const scriptDir = path.dirname(fileURLToPath(import.meta.url));
-const pluginRoot = path.resolve(scriptDir, '..', '..', '..');
-
-const normalizeString = (value) => {
-  if (typeof value !== 'string') return '';
-  return String(value || '').trim();
-};
-const nowIso = () => new Date().toISOString();
-
-const makeId = () => {
-  try {
-    return randomUUID();
-  } catch {
-    return `${Date.now().toString(36)}_${Math.random().toString(16).slice(2)}`;
-  }
-};
-
-const ensureDir = (dir) => {
-  if (!dir) return;
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-  } catch {
-    // ignore
-  }
-};
-
-const readJsonFile = (filePath) => {
-  if (!filePath) return null;
-  try {
-    if (!fs.existsSync(filePath)) return null;
-    const raw = fs.readFileSync(filePath, 'utf8');
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' ? parsed : null;
-  } catch {
-    return null;
-  }
-};
-
-const writeJsonFileAtomic = (filePath, data) => {
-  if (!filePath) return;
-  try {
-    const dir = path.dirname(filePath);
-    ensureDir(dir);
-    const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-    fs.renameSync(tmp, filePath);
-  } catch (e) {
-    try {
-      process.stderr.write(`[mcp] write failed: ${e?.message || String(e)}\n`);
-    } catch {
-      // ignore
-    }
-  }
-};
-
-const findUpwardsDataDir = (startPath, pluginId) => {
-  const raw = normalizeString(startPath);
-  if (!raw) return '';
-  let current = raw;
-  try {
-    current = path.resolve(raw);
-  } catch {
-    current = raw;
-  }
-  for (let i = 0; i < 50; i += 1) {
-    const candidate = path.join(current, '.chatos', 'data', pluginId);
-    try {
-      if (fs.existsSync(candidate)) return candidate;
-    } catch {
-      // ignore
-    }
-    const parent = path.dirname(current);
-    if (!parent || parent === current) break;
-    current = parent;
-  }
-  return '';
-};
-
-const findGitRepoRoot = (startPath) => {
-  const raw = normalizeString(startPath);
-  if (!raw) return '';
-  let current = raw;
-  try {
-    current = path.resolve(raw);
-  } catch {
-    current = raw;
-  }
-  try {
-    const stat = fs.statSync(current);
-    if (stat.isFile()) current = path.dirname(current);
-  } catch {
-    return '';
-  }
-  for (let i = 0; i < 100; i += 1) {
-    try {
-      if (fs.existsSync(path.join(current, '.git'))) return current;
-    } catch {
-      // ignore
-    }
-    const parent = path.dirname(current);
-    if (!parent || parent === current) break;
-    current = parent;
-  }
-  return '';
-};
-
-const resolveDataDirFromStateDir = (stateDir) => {
-  const raw = normalizeString(stateDir);
-  if (!raw) return '';
-  return path.join(raw, 'ui_apps', 'data', PLUGIN_ID);
-};
-
-const looksLikeDataDir = (value) => {
-  const raw = normalizeString(value);
-  if (!raw) return false;
-  let resolved = raw;
-  try {
-    resolved = path.resolve(raw);
-  } catch {
-    resolved = raw;
-  }
-  const normalized = resolved.split(path.sep).join('/');
-  return (
-    normalized.endsWith(`/ui_apps/data/${PLUGIN_ID}`) ||
-    normalized.endsWith(`/.chatos/data/${PLUGIN_ID}`)
-  );
-};
-
-const resolveStateDirFromEnv = () => {
-  const direct =
-    normalizeString(process.env?.CHATOS_UI_APPS_STATE_DIR) ||
-    normalizeString(process.env?.CHATOS_STATE_DIR) ||
-    normalizeString(process.env?.MODEL_CLI_STATE_DIR);
-  if (direct) return direct;
-  const hostApp = normalizeString(process.env?.MODEL_CLI_HOST_APP) || 'chatos';
-  const sessionRoot = normalizeString(process.env?.MODEL_CLI_SESSION_ROOT);
-  const home = normalizeString(process.env?.HOME || process.env?.USERPROFILE);
-  const base = sessionRoot || home;
-  if (!base) return '';
-  return path.join(base, '.deepseek_cli', hostApp);
-};
-
-const resolveDataDirFromEnv = () => resolveDataDirFromStateDir(resolveStateDirFromEnv());
-
-const resolveDataDir = () => {
-  const envDir =
-    normalizeString(process.env?.CHATOS_UI_APPS_DATA_DIR) ||
-    normalizeString(process.env?.CHATOS_UI_APP_DATA_DIR) ||
-    normalizeString(process.env?.CHATOS_DATA_DIR);
-  if (envDir) return envDir;
-  const fromEnv = resolveDataDirFromEnv();
-  if (fromEnv) return fromEnv;
-  const fromCwd = findUpwardsDataDir(process.cwd(), PLUGIN_ID);
-  if (fromCwd) return fromCwd;
-  const fromPlugin = findUpwardsDataDir(pluginRoot, PLUGIN_ID);
-  if (fromPlugin) return fromPlugin;
-  return path.join(process.cwd(), '.chatos', 'data', PLUGIN_ID);
-};
-
-const resolveDataDirFromMeta = (meta) => {
-  const fromUiApp = normalizeString(meta?.chatos?.uiApp?.dataDir);
-  if (fromUiApp) return fromUiApp;
-  const fromStateDir = resolveDataDirFromStateDir(meta?.chatos?.uiApp?.stateDir);
-  if (fromStateDir) return fromStateDir;
-  const fromWorkdir = normalizeString(meta?.workdir);
-  if (fromWorkdir && looksLikeDataDir(fromWorkdir)) return fromWorkdir;
-  return '';
-};
-
-const resolveDataDirWithMeta = (meta) => resolveDataDirFromMeta(meta) || resolveDataDir();
-
-const resolveDefaultWorkingDirectory = (meta) => {
-  const fromProject = normalizeString(meta?.chatos?.uiApp?.projectRoot);
-  if (fromProject) return fromProject;
-  const fromSession = normalizeString(meta?.chatos?.uiApp?.sessionRoot);
-  if (fromSession) return fromSession;
-  const fromWorkdir = normalizeString(meta?.workdir);
-  if (fromWorkdir) return fromWorkdir;
-  return process.cwd();
-};
-
-const getStateFile = (meta) => {
-  const dataDir = resolveDataDirWithMeta(meta);
-  return dataDir ? path.join(dataDir, STATE_FILE_NAME) : '';
-};
-
-const getRequestsFile = (meta) => {
-  const dataDir = resolveDataDirWithMeta(meta);
-  return dataDir ? path.join(dataDir, REQUESTS_FILE_NAME) : '';
-};
-
-const send = (msg) => {
-  try {
-    process.stdout.write(`${JSON.stringify(msg)}\n`);
-  } catch (e) {
-    try {
-      process.stderr.write(`[mcp] failed to send: ${e?.message || String(e)}\n`);
-    } catch {
-      // ignore
-    }
-  }
-};
-
-const sendNotification = (method, params) => {
-  if (!method) return;
-  send({ jsonrpc: '2.0', method, params });
-};
-
-const jsonRpcError = (id, code, message, data) => ({
-  jsonrpc: '2.0',
-  id,
-  error: {
-    code,
-    message,
-    ...(data !== undefined ? { data } : {}),
-  },
-});
-
-const jsonRpcResult = (id, result) => ({ jsonrpc: '2.0', id, result });
-
-const parseIsoTime = (value) => {
-  const ts = Date.parse(value || '');
-  return Number.isFinite(ts) ? ts : 0;
-};
-
-const parseWindowTime = (win) => {
-  const updated = Date.parse(win?.updatedAt || '') || 0;
-  if (updated) return updated;
-  return Date.parse(win?.createdAt || '') || 0;
-};
-
-const sortWindowsByRecent = (windows) =>
-  Array.isArray(windows) ? windows.slice().sort((a, b) => parseWindowTime(b) - parseWindowTime(a)) : [];
-const isRunningStatus = (value) => {
-  const status = normalizeString(value).toLowerCase();
-  return status === 'running' || status === 'aborting';
-};
-const normalizePath = (value) => {
-  const raw = normalizeString(value);
-  if (!raw) return '';
-  try {
-    return path.resolve(raw);
-  } catch {
-    return raw;
-  }
-};
-const getWindowWorkingDirectory = (win) =>
-  normalizePath(win?.lastRunOptions?.workingDirectory || win?.defaultRunOptions?.workingDirectory || '');
-const findWindowByWorkingDirectory = (windows, workingDirectory, { includeRunning = false } = {}) => {
-  const needle = normalizePath(workingDirectory);
-  if (!needle) return null;
-  return Array.isArray(windows)
-    ? windows.find((win) => {
-        if (!includeRunning && isRunningStatus(win?.status)) return false;
-        const workdir = getWindowWorkingDirectory(win);
-        return workdir && workdir === needle;
-      })
-    : null;
-};
-
-const toolResultText = (text) => ({
-  content: [{ type: 'text', text: String(text ?? '') }],
-});
+import {
+  COMPLETION_POLL_MS,
+  COMPLETION_TIMEOUT_MS,
+  DEFAULT_APPROVAL,
+  DEFAULT_MODEL,
+  MCP_PROTOCOL_VERSION,
+} from './mcp/constants.mjs';
+import { readJsonFile } from './mcp/files.mjs';
+import {
+  findGitRepoRoot,
+  getStateFile,
+  resolveDefaultWorkingDirectory,
+} from './mcp/paths.mjs';
+import { appendStartRunRequest } from './mcp/requests.mjs';
+import { jsonRpcError, jsonRpcResult, send, sendNotification, toolResultText } from './mcp/rpc.mjs';
+import { makeId, normalizeString, nowIso, parseIsoTime } from './mcp/utils.mjs';
+import { findWindowByWorkingDirectory, isRunningStatus, sortWindowsByRecent } from './mcp/windows.mjs';
 
 const loadState = (meta) =>
   readJsonFile(getStateFile(meta)) || { version: 0, windows: [], windowLogs: {}, windowTasks: {} };
@@ -319,21 +57,6 @@ const mergeRunOptionsForRequest = (base, override) => {
     }
   }
   return merged;
-};
-
-const normalizeRequests = (raw) => {
-  const data = raw && typeof raw === 'object' ? { ...raw } : {};
-  if (!Array.isArray(data.createWindows)) data.createWindows = [];
-  if (!Array.isArray(data.startRuns)) data.startRuns = [];
-  data.version = STATE_VERSION;
-  return data;
-};
-
-const appendStartRunRequest = (entry, meta) => {
-  const requestsFile = getRequestsFile(meta);
-  const requests = normalizeRequests(readJsonFile(requestsFile));
-  requests.startRuns.push(entry);
-  writeJsonFileAtomic(requestsFile, requests);
 };
 
 const pendingCompletions = new Map();
@@ -461,7 +184,7 @@ const handleRequest = async (req) => {
       const windows = sortWindowsByRecent(Array.isArray(state?.windows) ? state.windows : []);
       const defaultsApplied = buildDefaultsApplied({}, meta);
       const workingDirectory = normalizeString(defaultsApplied.workingDirectory);
-      const windowByWorkdir = findWindowByWorkingDirectory(windows, workingDirectory);
+      const windowByWorkdir = findWindowByWorkingDirectory(windows, workingDirectory, { includeRunning: true });
       const baseOptions = windowByWorkdir?.defaultRunOptions || windowByWorkdir?.lastRunOptions || {};
       const runOptions = mergeRunOptionsForRequest(defaultsApplied, baseOptions);
       if (workingDirectory) runOptions.workingDirectory = workingDirectory;
@@ -478,6 +201,7 @@ const handleRequest = async (req) => {
       appendStartRunRequest(
         {
           id: requestId,
+          source: 'mcp',
           windowId: targetWindowId,
           windowName: '',
           ensureWindow: true,
