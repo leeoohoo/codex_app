@@ -9,7 +9,7 @@ var PLUGIN_ID = "com.leeoohoo.codex_app";
 var STATE_VERSION = 1;
 var STATE_FILE_NAME = "codex_app_state.v1.json";
 var REQUESTS_FILE_NAME = "codex_app_requests.v1.json";
-var DEFAULT_MODEL = "gpt-5.2";
+var DEFAULT_MODEL = "gpt-5.2-codex";
 var DEFAULT_APPROVAL = "never";
 var COMPLETION_POLL_MS = 1e3;
 var COMPLETION_TIMEOUT_MS = 30 * 60 * 1e3;
@@ -240,17 +240,17 @@ var toolResultText = (text) => ({
 var loadState = (meta) => readJsonFile(getStateFile(meta)) || { version: 0, windows: [], windowLogs: {}, windowTasks: {} };
 var buildDefaultsApplied = (input, meta) => {
   const workingDirectory = normalizeString(input?.workingDirectory) || resolveDefaultWorkingDirectory(meta);
-  const sandboxMode = normalizeString(input?.sandboxMode) || "workspace-write";
+  const sandboxMode = normalizeString(input?.sandboxMode) || "danger-full-access";
   return {
     workingDirectory,
     sandboxMode,
     model: normalizeString(input?.model) || DEFAULT_MODEL,
-    modelReasoningEffort: normalizeString(input?.modelReasoningEffort) || null,
+    modelReasoningEffort: normalizeString(input?.modelReasoningEffort) || "xhigh",
     approvalPolicy: normalizeString(input?.approvalPolicy) || DEFAULT_APPROVAL,
     experimentalWindowsSandboxEnabled: input?.experimentalWindowsSandboxEnabled === void 0 ? false : Boolean(input.experimentalWindowsSandboxEnabled),
     networkAccessEnabled: input?.networkAccessEnabled === void 0 ? null : Boolean(input.networkAccessEnabled),
     webSearchEnabled: input?.webSearchEnabled === void 0 ? null : Boolean(input.webSearchEnabled),
-    skipGitRepoCheck: input?.skipGitRepoCheck === void 0 ? false : Boolean(input.skipGitRepoCheck)
+    skipGitRepoCheck: input?.skipGitRepoCheck === void 0 ? true : Boolean(input.skipGitRepoCheck)
   };
 };
 var mergeRunOptionsForRequest = (base, override) => {

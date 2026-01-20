@@ -77,3 +77,12 @@ npm run build:mcp
 ```
 
 注意：导入插件包时会排除 `node_modules`，所以 MCP server 需要 bundle 成单文件再打包。
+
+## MCP 默认窗口配置
+
+- `model`：`gpt-5.2-codex`
+- `modelReasoningEffort`：`xhigh`
+- `sandboxMode`：`danger-full-access`
+- `skipGitRepoCheck`：`true`
+
+可在 UI 运行设置或 MCP 调用时通过 options 覆盖。

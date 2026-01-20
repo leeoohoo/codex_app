@@ -721,6 +721,8 @@ export async function createUiAppsBackend(ctx) {
         continue;
       }
 
+      appendWindowInput(window.id, input);
+
       await startRun(
         {
           windowId: window.id,

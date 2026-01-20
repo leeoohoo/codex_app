@@ -2080,7 +2080,7 @@ export function mount({ container, host, slots }) {
     { value: 'workspace-write', label: 'workspace-write' },
     { value: 'danger-full-access', label: 'danger-full-access' },
   ]);
-  sandboxSelect.value = 'workspace-write';
+  sandboxSelect.value = 'danger-full-access';
 
   const approvalSelect = mkSelect([
     { value: '', label: 'approval：默认' },
@@ -2134,14 +2134,14 @@ export function mount({ container, host, slots }) {
   const DEFAULT_RUN_SETTINGS = {
     codexCommand: 'codex',
     workingDirectory: '',
-    model: 'gpt-5.2',
-    modelReasoningEffort: '',
+    model: 'gpt-5.2-codex',
+    modelReasoningEffort: 'xhigh',
     experimentalWindowsSandboxEnabled: false,
-    sandboxMode: 'workspace-write',
+    sandboxMode: 'danger-full-access',
     approvalPolicy: 'never',
     networkAccessEnabled: '',
     webSearchEnabled: '',
-    skipGitRepoCheck: false,
+    skipGitRepoCheck: true,
     skipGitRepoCheckExplicit: false,
   };
 

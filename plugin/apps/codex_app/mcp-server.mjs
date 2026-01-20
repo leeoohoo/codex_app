@@ -15,7 +15,7 @@ const PLUGIN_ID = 'com.leeoohoo.codex_app';
 const STATE_VERSION = 1;
 const STATE_FILE_NAME = 'codex_app_state.v1.json';
 const REQUESTS_FILE_NAME = 'codex_app_requests.v1.json';
-const DEFAULT_MODEL = 'gpt-5.2';
+const DEFAULT_MODEL = 'gpt-5.2-codex';
 const DEFAULT_APPROVAL = 'never';
 const COMPLETION_POLL_MS = 1000;
 const COMPLETION_TIMEOUT_MS = 30 * 60 * 1000;
@@ -290,17 +290,17 @@ const loadState = (meta) =>
 
 const buildDefaultsApplied = (input, meta) => {
   const workingDirectory = normalizeString(input?.workingDirectory) || resolveDefaultWorkingDirectory(meta);
-  const sandboxMode = normalizeString(input?.sandboxMode) || 'workspace-write';
+  const sandboxMode = normalizeString(input?.sandboxMode) || 'danger-full-access';
   return {
     workingDirectory,
     sandboxMode,
     model: normalizeString(input?.model) || DEFAULT_MODEL,
-    modelReasoningEffort: normalizeString(input?.modelReasoningEffort) || null,
+    modelReasoningEffort: normalizeString(input?.modelReasoningEffort) || 'xhigh',
     approvalPolicy: normalizeString(input?.approvalPolicy) || DEFAULT_APPROVAL,
     experimentalWindowsSandboxEnabled: input?.experimentalWindowsSandboxEnabled === undefined ? false : Boolean(input.experimentalWindowsSandboxEnabled),
     networkAccessEnabled: input?.networkAccessEnabled === undefined ? null : Boolean(input.networkAccessEnabled),
     webSearchEnabled: input?.webSearchEnabled === undefined ? null : Boolean(input.webSearchEnabled),
-    skipGitRepoCheck: input?.skipGitRepoCheck === undefined ? false : Boolean(input.skipGitRepoCheck),
+    skipGitRepoCheck: input?.skipGitRepoCheck === undefined ? true : Boolean(input.skipGitRepoCheck),
   };
 };
 
