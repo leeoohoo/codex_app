@@ -24,6 +24,12 @@ export async function createUiAppsBackend(ctx) {
   const store = getOrCreateBackendStore(ctx);
   store.refCount = Number.isFinite(store.refCount) ? store.refCount + 1 : 1;
 
+  if (!(store.windows instanceof Map)) store.windows = new Map();
+  if (!(store.runs instanceof Map)) store.runs = new Map();
+  if (!(store.windowLogs instanceof Map)) store.windowLogs = new Map();
+  if (!(store.windowInputs instanceof Map)) store.windowInputs = new Map();
+  if (!(store.mcpTasks instanceof Map)) store.mcpTasks = new Map();
+
   const windows = store.windows; // windowId -> { id, name, threadId, status, createdAt, updatedAt, activeRunId }
   const runs = store.runs; // runId -> { id, windowId, status, startedAt, finishedAt, events: [], error, abortController }
   const windowLogs = store.windowLogs; // windowId -> { events: object[], lines: string[], updatedAt }
@@ -816,7 +822,10 @@ export async function createUiAppsBackend(ctx) {
       scheduleStateWrite();
       if (run.mcpTaskId) {
         const task = markMcpTaskFinished(run.mcpTaskId, status, run.error);
-        if (task) applyMcpTaskResult(task, run);
+        if (task) {
+          applyMcpTaskResult(task, run);
+          writeMcpTaskResultPrompt(task, run);
+        }
       }
       if (requestsFile) {
         setTimeout(() => {

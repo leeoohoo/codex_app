@@ -57,6 +57,12 @@ export const getOrCreateBackendStore = (ctx) => {
     if (stateDir && stateDir !== store.stateDir) store.stateDir = stateDir;
     if (!store.stateFile && stateFile) store.stateFile = stateFile;
     if (!store.requestsFile && requestsFile) store.requestsFile = requestsFile;
+    if (!(store.windows instanceof Map)) store.windows = new Map();
+    if (!(store.runs instanceof Map)) store.runs = new Map();
+    if (!(store.windowLogs instanceof Map)) store.windowLogs = new Map();
+    if (!(store.windowInputs instanceof Map)) store.windowInputs = new Map();
+    if (!(store.mcpTasks instanceof Map)) store.mcpTasks = new Map();
+    if (!store.restored) store.restored = false;
   }
 
   return store;
