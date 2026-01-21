@@ -14,13 +14,13 @@ How to send a message (prompt):
 - Only pass `prompt`.
 - Working directory follows the default protocol (projectRoot / sessionRoot / workdir); callers should not pass it.
 - The server auto-picks a runnable window by working directory; if none exists, it creates one.
-- A successful call returns `调用成功` immediately to confirm delegation.
-- When the run finishes, a `codex_app.window_run.completed` notification is sent with `result: "😊"`.
+- Just wait for the tool to return (the host injects `taskId` and polls the UI prompt log in the background).
+- The tool output is the final result (it may take some time).
 
 Tools (only):
 
-- `codex_app_window_run`: async run with delegated ownership (returns `调用成功`; notifies `😊` on completion)
+- `codex_app_window_run`: async run with delegated ownership (returns final result)
 
 Additional note:
 
-Once a task is handed off to Codex, treat it as completed and do not check the result; if there are no more tasks, you can end the conversation. Your role is to analyze and clearly describe the problem to Codex, not to execute it yourself. Avoid assigning overly complex tasks at once—split them into smaller tasks when needed. Again, after handing off to Codex, consider it done and close the conversation if nothing else remains.
+Once a task is handed off to Codex, wait for the result before continuing the conversation. Your role is to analyze and clearly describe the problem to Codex, not to execute it yourself. Avoid assigning overly complex tasks at once—split them into smaller tasks when needed.

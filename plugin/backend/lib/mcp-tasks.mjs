@@ -77,6 +77,7 @@ export const createMcpTaskManager = ({ ctx, mcpTasks, stateDir, stateFile, sched
       }
       if (!existing.windowId) existing.windowId = normalizeString(req?.windowId);
       if (!existing.createdAt) existing.createdAt = normalizeString(req?.createdAt) || nowIso();
+      if (!existing.promptRequestId) existing.promptRequestId = id;
       existing.source = existing.source || 'mcp';
       return existing;
     }
@@ -93,7 +94,7 @@ export const createMcpTaskManager = ({ ctx, mcpTasks, stateDir, stateFile, sched
       startedAt: '',
       finishedAt: '',
       error: null,
-      promptRequestId: `mcp-task:${id}`,
+      promptRequestId: id,
       promptSentAt: '',
     };
     mcpTasks.set(id, task);
@@ -166,7 +167,7 @@ export const createMcpTaskManager = ({ ctx, mcpTasks, stateDir, stateFile, sched
     const pluginId = normalizeString(run?.pluginId || ctx?.pluginId);
     const appId = normalizeString(run?.appId || ctx?.appId || 'codex_app');
     const source = pluginId ? (appId ? `${pluginId}:${appId}` : pluginId) : '';
-    const requestId = task.promptRequestId || `mcp-task:${task.id}`;
+    const requestId = task.promptRequestId || task.id;
     const entry = {
       ts: nowIso(),
       type: 'ui_prompt',

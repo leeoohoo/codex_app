@@ -219,6 +219,14 @@ const clearCompletionWatcher = (token) => {
 
 const clearStreamWatcher = (token) => {
   if (!token) return;
+  
+  // 调试日志
+  try {
+    console.error(`[MCP DEBUG] clearStreamWatcher: token=${token}, hasTimer=${pendingStreams.has(token)}\n`);
+  } catch (e) {
+    // ignore
+  }
+  
   const timer = pendingStreams.get(token);
   if (timer) clearInterval(timer);
   pendingStreams.delete(token);
@@ -291,6 +299,14 @@ const scheduleCompletionNotification = ({ requestId, windowId, requestedAt, meta
 
 const scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rpcId, sessionId }) => {
   if (!windowId) return '';
+  
+  // 调试日志
+  try {
+    console.error(`[MCP DEBUG] scheduleStreamNotification called: requestId=${requestId}, windowId=${windowId}, rpcId=${rpcId}, sessionId=${sessionId || 'none'}`);
+  } catch (e) {
+    // ignore
+  }
+  
   const token = makeId();
   const startMs = Date.now();
   const requestedAtMs = parseIsoTime(requestedAt);
@@ -300,10 +316,27 @@ const scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rp
   const sessionTag = sessionId ? { sessionId } : {};
 
   const poll = () => {
+    // 调试日志
+    try {
+      console.error(`[MCP DEBUG][${new Date().toISOString()}] poll: windowId=${windowId}, trackedRunId=${trackedRunId || 'none'}, lastIndex=${lastIndex}`);
+    } catch (e) {
+      // ignore
+    }
+    
     const state = loadState(meta);
     const windows = Array.isArray(state?.windows) ? state.windows : [];
     const runs = Array.isArray(state?.runs) ? state.runs : [];
     const win = windows.find((w) => w?.id === windowId) || null;
+    
+    // 调试：状态信息
+    try {
+      console.error(`[MCP DEBUG] state: windows=${windows.length}, runs=${runs.length}, foundWindow=${!!win}\n`);
+      if (win) {
+        console.error(`[MCP DEBUG] window activeRunId: ${win.activeRunId || 'none'}\n`);
+      }
+    } catch (e) {
+      // ignore
+    }
 
     if (!trackedRunId) {
       const activeRunId = normalizeString(win?.activeRunId);
@@ -362,45 +395,116 @@ const scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rp
 
     if (run) {
       const status = normalizeString(run?.status);
+      
+      // 调试：运行状态
+      try {
+        console.error(`[MCP DEBUG] run found: id=${trackedRunId}, status=${status}, isRunning=${isRunningStatus(status)}\n`);
+      } catch (e) {
+        // ignore
+      }
+      
       if (status && !isRunningStatus(status)) {
-        const finalText = lastAssistantText || pickAssistantMessageFromEvents(events);
-        if (finalText) {
-          const chunks = splitTextIntoChunks(finalText, STREAM_TEXT_CHUNK_CHARS);
-          const chunkId = makeId();
-          const chunkCount = chunks.length || 0;
-          if (chunkCount === 0) {
+        // 尝试获取最终文本，优先使用assistant文本
+        let finalText = lastAssistantText || pickAssistantMessageFromEvents(events);
+        
+        // 调试：finalText提取
+        try {
+          console.error(`[MCP DEBUG] finalText extraction: lastAssistantText=${lastAssistantText ? 'yes' : 'no'}, fromEvents=${!!pickAssistantMessageFromEvents(events)}\n`);
+        } catch (e) {
+          // ignore
+        }
+        
+        // 如果无法提取assistant文本，生成降级文本
+        if (!finalText) {
+          // 基于运行状态生成描述性文本
+          const statusMap = {
+            'completed': '任务已完成',
+            'failed': '任务执行失败',
+            'aborted': '任务已中止',
+            'cancelled': '任务已取消',
+            'timeout': '任务执行超时'
+          };
+          const statusText = statusMap[status] || `任务状态: ${status}`;
+          
+          // 尝试从事件中提取一些有用的信息
+          const eventSummary = events
+            .slice(-10) // 取最后10个事件
+            .map(evt => {
+              if (evt.source === 'codex' && evt.event?.type === 'item.completed') {
+                const item = evt.event.item || {};
+                return `- ${item.type || '未知类型'}: ${item.status || '完成'}`;
+              }
+              return null;
+            })
+            .filter(Boolean)
+            .join('\n');
+          
+          finalText = `Codex应用执行${statusText}。\n${eventSummary || '无详细事件记录。'}`;
+        }
+        
+        // 确保finalText不为空
+        finalText = finalText || `Codex应用执行完成，状态: ${status}`;
+        
+        // 调试：finalText内容
+        try {
+          console.error(`[MCP DEBUG] finalText ready: length=${finalText.length}, status=${status}\n`);
+          console.error(`[MCP DEBUG] finalText preview: ${finalText.substring(0, 100)}${finalText.length > 100 ? '...' : ''}\n`);
+        } catch (e) {
+          // ignore
+        }
+        
+        // 发送finalText（分块或整体）
+        const chunks = splitTextIntoChunks(finalText, STREAM_TEXT_CHUNK_CHARS);
+        const chunkId = makeId();
+        const chunkCount = chunks.length || 0;
+        
+        // 调试：分块信息
+        try {
+          console.error(`[MCP DEBUG] sending finalText: chunkCount=${chunkCount}, rpcId=${rpcId}\n`);
+        } catch (e) {
+          // ignore
+        }
+        if (chunkCount === 0) {
+          sendNotification('codex_app.window_run.stream', {
+            requestId,
+            rpcId,
+            ...sessionTag,
+            windowId,
+            runId: trackedRunId,
+            finalText,
+            text: finalText,
+            final: true,
+            finalTextComplete: true,
+          });
+        } else {
+          for (let i = 0; i < chunks.length; i += 1) {
+            const chunk = chunks[i];
             sendNotification('codex_app.window_run.stream', {
               requestId,
               rpcId,
               ...sessionTag,
               windowId,
               runId: trackedRunId,
-              finalText,
-              text: finalText,
+              finalText: chunk,
+              text: chunk,
               final: true,
-              finalTextComplete: true,
+              finalTextChunk: true,
+              chunkId,
+              chunkIndex: i,
+              chunkCount,
+              finalTextComplete: chunkCount === 1 && i === 0,
             });
-          } else {
-            for (let i = 0; i < chunks.length; i += 1) {
-              const chunk = chunks[i];
-              sendNotification('codex_app.window_run.stream', {
-                requestId,
-                rpcId,
-                ...sessionTag,
-                windowId,
-                runId: trackedRunId,
-                finalText: chunk,
-                text: chunk,
-                final: true,
-                finalTextChunk: true,
-                chunkId,
-                chunkIndex: i,
-                chunkCount,
-                finalTextComplete: chunkCount === 1 && i === 0,
-              });
-            }
           }
         }
+        
+        // 调试：发送完成通知
+        try {
+          console.error(`[MCP DEBUG] sending done notification: status=${status}, runId=${trackedRunId}\n`);
+        } catch (e) {
+          // ignore
+        }
+        
+        // 发送完成通知
         sendNotification('codex_app.window_run.stream', {
           requestId,
           rpcId,
@@ -411,12 +515,26 @@ const scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rp
           status,
           finishedAt: run?.finishedAt || '',
         });
+        
+        // 调试：清理stream watcher
+        try {
+          console.error(`[MCP DEBUG] clearing stream watcher: run completed, status=${status}\n`);
+        } catch (e) {
+          // ignore
+        }
+        
         clearStreamWatcher(token);
         return;
       }
     }
 
     if (Date.now() - startMs > STREAM_TIMEOUT_MS) {
+      // 调试：超时清理
+      try {
+        console.error(`[MCP DEBUG] stream timeout: elapsed=${Date.now() - startMs}ms > ${STREAM_TIMEOUT_MS}ms\n`);
+      } catch (e) {
+        // ignore
+      }
       clearStreamWatcher(token);
     }
   };
@@ -480,6 +598,10 @@ const handleRequest = async (req) => {
         `${prompt}\n\n执行任务前，先进行分析，将分析后的结果和任务创建根目录下的 codex_plan.md 文件，然后根据这个文件中任务逐一执行。完成后请保留该文件，系统会读取并删除。`;
 
       const meta = params?._meta;
+      const taskId = normalizeString(meta?.taskId);
+      if (!taskId) {
+        return jsonRpcError(id, -32602, 'taskId is required in _meta');
+      }
       const sessionId = normalizeString(meta?.sessionId);
       const state = loadState(meta);
       const windows = sortWindowsByRecent(Array.isArray(state?.windows) ? state.windows : []);
@@ -497,7 +619,7 @@ const handleRequest = async (req) => {
       const createdWindowId = windowByWorkdir?.id ? '' : makeId();
       const targetWindowId = windowByWorkdir?.id || createdWindowId;
 
-      const requestId = makeId();
+      const requestId = taskId;
       const requestCreatedAt = nowIso();
       appendStartRunRequest(
         {
@@ -524,17 +646,6 @@ const handleRequest = async (req) => {
         rpcId: id,
         sessionId,
       });
-      const streamEnabled = params?._meta?.stream === undefined ? true : Boolean(params?._meta?.stream);
-      if (streamEnabled) {
-        scheduleStreamNotification({
-          requestId,
-          windowId: targetWindowId,
-          requestedAt: requestCreatedAt,
-          meta,
-          rpcId: id,
-          sessionId,
-        });
-      }
 
       return jsonRpcResult(id, toolResultText('调用成功'));
     }
