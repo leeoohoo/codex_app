@@ -607,7 +607,24 @@ const handleRequest = async (req) => {
       const windows = sortWindowsByRecent(Array.isArray(state?.windows) ? state.windows : []);
       const defaultsApplied = buildDefaultsApplied({}, meta);
       const workingDirectory = normalizeString(defaultsApplied.workingDirectory);
+      try {
+        console.error('[MCP DEBUG] findWindowByWorkingDirectory: start', {
+          workingDirectory,
+          windows: windows.length,
+        });
+      } catch {
+        // ignore
+      }
       const windowByWorkdir = findWindowByWorkingDirectory(windows, workingDirectory, { includeRunning: true });
+      try {
+        console.error('[MCP DEBUG] findWindowByWorkingDirectory: result', {
+          workingDirectory,
+          windowId: windowByWorkdir?.id || '',
+          status: windowByWorkdir?.status || '',
+        });
+      } catch {
+        // ignore
+      }
       const baseOptions = windowByWorkdir?.defaultRunOptions || windowByWorkdir?.lastRunOptions || {};
       const runOptions = mergeRunOptionsForRequest(defaultsApplied, baseOptions);
       if (workingDirectory) runOptions.workingDirectory = workingDirectory;

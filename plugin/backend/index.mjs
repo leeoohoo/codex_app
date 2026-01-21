@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import path from 'node:path';
 import readline from 'node:readline';
 
 import {
@@ -18,6 +19,47 @@ import { createStateStore } from './lib/state-store.mjs';
 import { getOrCreateBackendStore } from './lib/store.mjs';
 import { normalizeTodoItems } from './lib/todo.mjs';
 import { clampNumber, makeId, normalizeString, nowIso } from './lib/utils.mjs';
+
+const parseWindowTime = (win) => {
+  const updated = Date.parse(win?.updatedAt || '') || 0;
+  if (updated) return updated;
+  return Date.parse(win?.createdAt || '') || 0;
+};
+
+const sortWindowsByRecent = (windowsList) =>
+  Array.isArray(windowsList) ? windowsList.slice().sort((a, b) => parseWindowTime(b) - parseWindowTime(a)) : [];
+
+const isRunningStatus = (value) => {
+  const status = normalizeString(value).toLowerCase();
+  return status === 'running' || status === 'aborting';
+};
+
+const normalizePath = (value) => {
+  const raw = normalizeString(value);
+  if (!raw) return '';
+  try {
+    return path.resolve(raw);
+  } catch {
+    return raw;
+  }
+};
+
+const getWindowWorkingDirectory = (win) =>
+  normalizePath(win?.lastRunOptions?.workingDirectory || win?.defaultRunOptions?.workingDirectory || '');
+
+const findWindowByWorkingDirectory = (windowsMap, workingDirectory, { includeRunning = false } = {}) => {
+  const needle = normalizePath(workingDirectory);
+  if (!needle) return null;
+  const list = windowsMap instanceof Map ? Array.from(windowsMap.values()) : Array.isArray(windowsMap) ? windowsMap : [];
+  const sorted = sortWindowsByRecent(list);
+  return (
+    sorted.find((win) => {
+      if (!includeRunning && isRunningStatus(win?.status)) return false;
+      const workdir = getWindowWorkingDirectory(win);
+      return workdir && workdir === needle;
+    }) || null
+  );
+};
 
 
 export async function createUiAppsBackend(ctx) {
@@ -99,16 +141,37 @@ export async function createUiAppsBackend(ctx) {
       const windowName = normalizeString(req?.windowName);
       const options = normalizeRunOptions(req?.options || {});
       const defaults = normalizeRunOptions(req?.defaults || {});
+      const resolvedDefaults = { ...defaults };
+      if (!resolvedDefaults.workingDirectory && options.workingDirectory) {
+        resolvedDefaults.workingDirectory = options.workingDirectory;
+      }
+      if (!resolvedDefaults.sandboxMode && options.sandboxMode) {
+        resolvedDefaults.sandboxMode = options.sandboxMode;
+      }
+      const lookupWorkingDirectory = resolvedDefaults.workingDirectory || options.workingDirectory;
       const threadId = normalizeString(req?.threadId);
       const codexCommand = normalizeString(req?.codexCommand) || 'codex';
 
       let window = windowId ? windows.get(windowId) : null;
+      if (!window && lookupWorkingDirectory) {
+        window = findWindowByWorkingDirectory(windows, lookupWorkingDirectory, { includeRunning: true });
+        if (window && task) {
+          task.windowId = window.id;
+          scheduleStateWrite();
+        }
+      }
       if (!window && ensureWindow) {
-        if (!defaults.workingDirectory || !defaults.sandboxMode) {
+        if (!resolvedDefaults.workingDirectory || !resolvedDefaults.sandboxMode) {
           pendingRuns.push(req);
           continue;
         }
-        window = createWindow({ id: windowId || makeId(), name: windowName, threadId, defaults, source: 'mcp' });
+        window = createWindow({
+          id: windowId || makeId(),
+          name: windowName,
+          threadId,
+          defaults: resolvedDefaults,
+          source: 'mcp',
+        });
       }
 
       if (!window) {
