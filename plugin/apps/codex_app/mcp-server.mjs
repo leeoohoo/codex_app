@@ -224,12 +224,13 @@ const clearStreamWatcher = (token) => {
   pendingStreams.delete(token);
 };
 
-const scheduleCompletionNotification = ({ requestId, windowId, requestedAt, meta, rpcId }) => {
+const scheduleCompletionNotification = ({ requestId, windowId, requestedAt, meta, rpcId, sessionId }) => {
   if (!windowId) return '';
   const token = makeId();
   const startMs = Date.now();
   const requestedAtMs = parseIsoTime(requestedAt);
   let trackedRunId = '';
+  const sessionTag = sessionId ? { sessionId } : {};
 
   const poll = () => {
     const state = loadState(meta);
@@ -265,6 +266,7 @@ const scheduleCompletionNotification = ({ requestId, windowId, requestedAt, meta
         sendNotification('codex_app.window_run.completed', {
           requestId,
           rpcId,
+          ...sessionTag,
           windowId,
           runId: trackedRunId,
           status,
@@ -287,7 +289,7 @@ const scheduleCompletionNotification = ({ requestId, windowId, requestedAt, meta
   return token;
 };
 
-const scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rpcId }) => {
+const scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rpcId, sessionId }) => {
   if (!windowId) return '';
   const token = makeId();
   const startMs = Date.now();
@@ -295,6 +297,7 @@ const scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rp
   let trackedRunId = '';
   let lastIndex = null;
   let lastAssistantText = '';
+  const sessionTag = sessionId ? { sessionId } : {};
 
   const poll = () => {
     const state = loadState(meta);
@@ -348,6 +351,7 @@ const scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rp
         sendNotification('codex_app.window_run.stream', {
           requestId,
           rpcId,
+          ...sessionTag,
           windowId,
           runId: trackedRunId,
           event: evt,
@@ -368,6 +372,7 @@ const scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rp
             sendNotification('codex_app.window_run.stream', {
               requestId,
               rpcId,
+              ...sessionTag,
               windowId,
               runId: trackedRunId,
               finalText,
@@ -381,6 +386,7 @@ const scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rp
               sendNotification('codex_app.window_run.stream', {
                 requestId,
                 rpcId,
+                ...sessionTag,
                 windowId,
                 runId: trackedRunId,
                 finalText: chunk,
@@ -398,6 +404,7 @@ const scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rp
         sendNotification('codex_app.window_run.stream', {
           requestId,
           rpcId,
+          ...sessionTag,
           windowId,
           runId: trackedRunId,
           done: true,
@@ -473,6 +480,7 @@ const handleRequest = async (req) => {
         `${prompt}\n\n执行任务前，先进行分析，将分析后的结果和任务创建根目录下的 codex_plan.md 文件，然后根据这个文件中任务逐一执行。完成后请保留该文件，系统会读取并删除。`;
 
       const meta = params?._meta;
+      const sessionId = normalizeString(meta?.sessionId);
       const state = loadState(meta);
       const windows = sortWindowsByRecent(Array.isArray(state?.windows) ? state.windows : []);
       const defaultsApplied = buildDefaultsApplied({}, meta);
@@ -514,6 +522,7 @@ const handleRequest = async (req) => {
         requestedAt: requestCreatedAt,
         meta,
         rpcId: id,
+        sessionId,
       });
       const streamEnabled = params?._meta?.stream === undefined ? true : Boolean(params?._meta?.stream);
       if (streamEnabled) {
@@ -523,6 +532,7 @@ const handleRequest = async (req) => {
           requestedAt: requestCreatedAt,
           meta,
           rpcId: id,
+          sessionId,
         });
       }
 

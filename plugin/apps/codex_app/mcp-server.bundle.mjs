@@ -449,12 +449,13 @@ var clearStreamWatcher = (token) => {
   if (timer) clearInterval(timer);
   pendingStreams.delete(token);
 };
-var scheduleCompletionNotification = ({ requestId, windowId, requestedAt, meta, rpcId }) => {
+var scheduleCompletionNotification = ({ requestId, windowId, requestedAt, meta, rpcId, sessionId }) => {
   if (!windowId) return "";
   const token = makeId();
   const startMs = Date.now();
   const requestedAtMs = parseIsoTime(requestedAt);
   let trackedRunId = "";
+  const sessionTag = sessionId ? { sessionId } : {};
   const poll = () => {
     const state = loadState(meta);
     const windows = Array.isArray(state?.windows) ? state.windows : [];
@@ -486,6 +487,7 @@ var scheduleCompletionNotification = ({ requestId, windowId, requestedAt, meta, 
         sendNotification("codex_app.window_run.completed", {
           requestId,
           rpcId,
+          ...sessionTag,
           windowId,
           runId: trackedRunId,
           status,
@@ -505,7 +507,7 @@ var scheduleCompletionNotification = ({ requestId, windowId, requestedAt, meta, 
   poll();
   return token;
 };
-var scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rpcId }) => {
+var scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rpcId, sessionId }) => {
   if (!windowId) return "";
   const token = makeId();
   const startMs = Date.now();
@@ -513,6 +515,7 @@ var scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rpcI
   let trackedRunId = "";
   let lastIndex = null;
   let lastAssistantText = "";
+  const sessionTag = sessionId ? { sessionId } : {};
   const poll = () => {
     const state = loadState(meta);
     const windows = Array.isArray(state?.windows) ? state.windows : [];
@@ -560,6 +563,7 @@ var scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rpcI
         sendNotification("codex_app.window_run.stream", {
           requestId,
           rpcId,
+          ...sessionTag,
           windowId,
           runId: trackedRunId,
           event: evt,
@@ -579,6 +583,7 @@ var scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rpcI
             sendNotification("codex_app.window_run.stream", {
               requestId,
               rpcId,
+              ...sessionTag,
               windowId,
               runId: trackedRunId,
               finalText,
@@ -592,6 +597,7 @@ var scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rpcI
               sendNotification("codex_app.window_run.stream", {
                 requestId,
                 rpcId,
+                ...sessionTag,
                 windowId,
                 runId: trackedRunId,
                 finalText: chunk,
@@ -609,6 +615,7 @@ var scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rpcI
         sendNotification("codex_app.window_run.stream", {
           requestId,
           rpcId,
+          ...sessionTag,
           windowId,
           runId: trackedRunId,
           done: true,
@@ -672,6 +679,7 @@ var handleRequest = async (req) => {
 
 \u6267\u884C\u4EFB\u52A1\u524D\uFF0C\u5148\u8FDB\u884C\u5206\u6790\uFF0C\u5C06\u5206\u6790\u540E\u7684\u7ED3\u679C\u548C\u4EFB\u52A1\u521B\u5EFA\u6839\u76EE\u5F55\u4E0B\u7684 codex_plan.md \u6587\u4EF6\uFF0C\u7136\u540E\u6839\u636E\u8FD9\u4E2A\u6587\u4EF6\u4E2D\u4EFB\u52A1\u9010\u4E00\u6267\u884C\u3002\u5B8C\u6210\u540E\u8BF7\u4FDD\u7559\u8BE5\u6587\u4EF6\uFF0C\u7CFB\u7EDF\u4F1A\u8BFB\u53D6\u5E76\u5220\u9664\u3002`;
       const meta = params?._meta;
+      const sessionId = normalizeString(meta?.sessionId);
       const state = loadState(meta);
       const windows = sortWindowsByRecent(Array.isArray(state?.windows) ? state.windows : []);
       const defaultsApplied = buildDefaultsApplied({}, meta);
@@ -710,7 +718,8 @@ var handleRequest = async (req) => {
         windowId: targetWindowId,
         requestedAt: requestCreatedAt,
         meta,
-        rpcId: id
+        rpcId: id,
+        sessionId
       });
       const streamEnabled = params?._meta?.stream === void 0 ? true : Boolean(params?._meta?.stream);
       if (streamEnabled) {
@@ -719,7 +728,8 @@ var handleRequest = async (req) => {
           windowId: targetWindowId,
           requestedAt: requestCreatedAt,
           meta,
-          rpcId: id
+          rpcId: id,
+          sessionId
         });
       }
       return jsonRpcResult(id, toolResultText("\u8C03\u7528\u6210\u529F"));
