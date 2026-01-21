@@ -11,6 +11,9 @@ var DEFAULT_MODEL = "gpt-5.2-codex";
 var DEFAULT_APPROVAL = "never";
 var COMPLETION_POLL_MS = 1e3;
 var COMPLETION_TIMEOUT_MS = 30 * 60 * 1e3;
+var STREAM_POLL_MS = 400;
+var STREAM_TIMEOUT_MS = 30 * 60 * 1e3;
+var STREAM_TEXT_CHUNK_CHARS = 4e3;
 
 // plugin/apps/codex_app/mcp/files.mjs
 import fs from "node:fs";
@@ -303,12 +306,148 @@ var mergeRunOptionsForRequest = (base, override) => {
   }
   return merged;
 };
+var normalizeMultilineText = (value) => String(value ?? "").replace(/\r\n?/g, "\n");
+var splitTextIntoChunks = (text, size) => {
+  const value = normalizeMultilineText(text);
+  if (!value) return [];
+  const chunkSize = Number.isFinite(size) && size > 0 ? Math.floor(size) : value.length;
+  if (chunkSize <= 0) return [value];
+  const chunks = [];
+  for (let i = 0; i < value.length; i += chunkSize) {
+    chunks.push(value.slice(i, i + chunkSize));
+  }
+  return chunks;
+};
+var extractTextFromValue = (value) => {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    const parts = value.map((part) => {
+      if (typeof part === "string") return part;
+      if (part && typeof part === "object" && typeof part.text === "string") return part.text;
+      return "";
+    }).filter(Boolean);
+    return parts.join("");
+  }
+  if (value && typeof value === "object" && typeof value.text === "string") return value.text;
+  return "";
+};
+var pickAssistantTextFromItem = (item) => {
+  if (!item || typeof item !== "object") return "";
+  const candidates = [item.text, item.content, item.message, item.output_text, item.outputText];
+  for (const candidate of candidates) {
+    const text = extractTextFromValue(candidate);
+    if (text) return normalizeMultilineText(text);
+  }
+  return "";
+};
+var formatCodexItem = (item) => {
+  if (!item || typeof item !== "object") return "";
+  const t = item.type;
+  if (t === "command_execution") {
+    const status = item.status ? ` status=${item.status}` : "";
+    const code = item.exit_code !== void 0 ? ` exit=${item.exit_code}` : "";
+    return `command ${JSON.stringify(item.command || "")}${status}${code}`;
+  }
+  if (t === "file_change") {
+    const changes = Array.isArray(item.changes) ? item.changes.map((c) => `${c.kind}:${c.path}`).join(", ") : "";
+    return `patch status=${item.status || ""}${changes ? ` changes=[${changes}]` : ""}`;
+  }
+  if (t === "mcp_tool_call") {
+    return `mcp ${String(item.server || "")}.${String(item.tool || "")} status=${String(item.status || "")}`;
+  }
+  if (t === "web_search") return `web_search ${JSON.stringify(item.query || "")}`;
+  if (t === "todo_list") return `todo_list (${Array.isArray(item.items) ? item.items.length : 0} items)`;
+  if (t === "error") return `error ${JSON.stringify(item.message || "")}`;
+  if (t === "reasoning") return `reasoning ${JSON.stringify(String(item.text || "").slice(0, 120))}`;
+  if (t === "agent_message") return `assistant ${JSON.stringify(String(item.text || "").slice(0, 160))}`;
+  return `${String(t || "item")} ${JSON.stringify(item).slice(0, 200)}`;
+};
+var pickAssistantMessageFromEvents = (events) => {
+  if (!Array.isArray(events) || !events.length) return "";
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const evt = events[i];
+    if (evt?.source !== "codex") continue;
+    const event = evt?.event || null;
+    if (!event) continue;
+    if (event.type !== "item.completed" && event.type !== "item.updated") continue;
+    const item = event.item || {};
+    const type = normalizeString(item?.type).toLowerCase();
+    if (!type) continue;
+    if (type === "agent_message" || type === "assistant_message" || type === "message") {
+      const text = pickAssistantTextFromItem(item);
+      if (!text) continue;
+      return text;
+    }
+  }
+  return "";
+};
+var extractAssistantTextFromEvent = (evt) => {
+  if (!evt || typeof evt !== "object") return "";
+  if (evt.source !== "codex") return "";
+  const event = evt.event || null;
+  if (!event) return "";
+  if (event.type !== "item.completed" && event.type !== "item.updated") return "";
+  const item = event.item || {};
+  const type = normalizeString(item?.type).toLowerCase();
+  if (!type) return "";
+  if (type !== "agent_message" && type !== "assistant_message" && type !== "message") return "";
+  const text = pickAssistantTextFromItem(item);
+  if (!text) return "";
+  return text;
+};
+var formatStreamEvent = (evt) => {
+  if (evt === void 0 || evt === null) return "";
+  if (typeof evt === "string") return evt;
+  if (typeof evt !== "object") return String(evt);
+  const ts = evt.ts || nowIso();
+  const trunc = evt.truncated ? ` \u2026(truncated, originalLength=${Number(evt.originalLength) || 0})` : "";
+  if (evt.source === "stderr") return `[${ts}] stderr ${String(evt.text || "").trimEnd()}${trunc}`;
+  if (evt.source === "raw") return `[${ts}] raw ${String(evt.text || "").trimEnd()}${trunc}`;
+  if (evt.line !== void 0) return `[${ts}] ${String(evt.line || "").trimEnd()}`;
+  if (evt.source === "system") {
+    if (evt.kind === "spawn") return `[${ts}] spawn ${String(evt.command || "")} ${Array.isArray(evt.args) ? evt.args.join(" ") : ""}`;
+    if (evt.kind === "status") return `[${ts}] status ${String(evt.status || "")}`;
+    if (evt.kind === "warning") return `[${ts}] warning ${String(evt.message || evt.warning || "")}`;
+    if (evt.kind === "error") return `[${ts}] error ${String(evt?.error?.message || "")}`;
+    if (evt.kind === "gap" && evt?.gap && Number.isFinite(evt.gap?.from) && Number.isFinite(evt.gap?.to)) {
+      return `[${ts}] gap dropped_events seq=[${evt.gap.from}, ${evt.gap.to})`;
+    }
+    return `[${ts}] system ${JSON.stringify(evt).slice(0, 320)}`;
+  }
+  if (evt.source === "codex") {
+    const e = evt.event || {};
+    if (e.type === "thread.started") return `[${ts}] thread.started threadId=${String(e.thread_id || "")}`;
+    if (e.type === "turn.started") return `[${ts}] turn.started`;
+    if (e.type === "turn.completed") return `[${ts}] turn.completed usage=${JSON.stringify(e.usage || null)}`;
+    if (e.type === "turn.failed") return `[${ts}] turn.failed ${String(e?.error?.message || "")}`;
+    if (e.type === "error") return `[${ts}] error ${String(e.message || "")}`;
+    if (e.type === "item.started") return `[${ts}] item.started ${formatCodexItem(e.item)}`;
+    if (e.type === "item.updated") return `[${ts}] item.updated ${formatCodexItem(e.item)}`;
+    if (e.type === "item.completed") return `[${ts}] item.completed ${formatCodexItem(e.item)}`;
+    return `[${ts}] ${String(e.type || "event")} ${JSON.stringify(e).slice(0, 320)}`;
+  }
+  return `[${ts}] ${JSON.stringify(evt).slice(0, 320)}`;
+};
+var getWindowLogEvents = (entry) => {
+  if (!entry || typeof entry !== "object") return [];
+  const events = Array.isArray(entry.events) ? entry.events : [];
+  if (events.length) return events;
+  const lines = Array.isArray(entry.lines) ? entry.lines : [];
+  return lines.map((line) => ({ source: "raw", text: String(line ?? "") }));
+};
 var pendingCompletions = /* @__PURE__ */ new Map();
+var pendingStreams = /* @__PURE__ */ new Map();
 var clearCompletionWatcher = (token) => {
   if (!token) return;
   const timer = pendingCompletions.get(token);
   if (timer) clearInterval(timer);
   pendingCompletions.delete(token);
+};
+var clearStreamWatcher = (token) => {
+  if (!token) return;
+  const timer = pendingStreams.get(token);
+  if (timer) clearInterval(timer);
+  pendingStreams.delete(token);
 };
 var scheduleCompletionNotification = ({ requestId, windowId, requestedAt, meta, rpcId }) => {
   if (!windowId) return "";
@@ -366,6 +505,129 @@ var scheduleCompletionNotification = ({ requestId, windowId, requestedAt, meta, 
   poll();
   return token;
 };
+var scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rpcId }) => {
+  if (!windowId) return "";
+  const token = makeId();
+  const startMs = Date.now();
+  const requestedAtMs = parseIsoTime(requestedAt);
+  let trackedRunId = "";
+  let lastIndex = null;
+  let lastAssistantText = "";
+  const poll = () => {
+    const state = loadState(meta);
+    const windows = Array.isArray(state?.windows) ? state.windows : [];
+    const runs = Array.isArray(state?.runs) ? state.runs : [];
+    const win = windows.find((w) => w?.id === windowId) || null;
+    if (!trackedRunId) {
+      const activeRunId = normalizeString(win?.activeRunId);
+      if (activeRunId) {
+        const candidate = runs.find((run2) => String(run2?.id || "") === activeRunId);
+        const startedAtMs = parseIsoTime(candidate?.startedAt);
+        if (candidate && (!requestedAtMs || startedAtMs >= requestedAtMs)) {
+          trackedRunId = String(candidate.id || "");
+        }
+      }
+    }
+    if (!trackedRunId) {
+      const candidates = runs.filter((run2) => {
+        if (String(run2?.windowId || "") !== windowId) return false;
+        const startedAtMs = parseIsoTime(run2?.startedAt);
+        return !requestedAtMs || startedAtMs >= requestedAtMs;
+      });
+      candidates.sort((a, b) => parseIsoTime(a?.startedAt) - parseIsoTime(b?.startedAt));
+      if (candidates.length) trackedRunId = String(candidates[0]?.id || "");
+    }
+    const run = trackedRunId ? runs.find((item) => String(item?.id || "") === trackedRunId) : null;
+    const logEntry = state?.windowLogs && typeof state.windowLogs === "object" ? state.windowLogs[windowId] : null;
+    const events = getWindowLogEvents(logEntry);
+    if (trackedRunId && lastIndex === null) {
+      const startAtMs = parseIsoTime(run?.startedAt) || requestedAtMs;
+      if (startAtMs) {
+        const foundIndex = events.findIndex((evt) => parseIsoTime(evt?.ts) >= startAtMs);
+        lastIndex = foundIndex >= 0 ? foundIndex : events.length;
+      } else {
+        lastIndex = 0;
+      }
+    }
+    if (trackedRunId && Number.isFinite(lastIndex)) {
+      if (events.length < lastIndex) lastIndex = 0;
+      const slice = events.slice(lastIndex);
+      lastIndex = events.length;
+      for (const evt of slice) {
+        const assistantText = extractAssistantTextFromEvent(evt);
+        if (assistantText) lastAssistantText = assistantText;
+        const text = formatStreamEvent(evt);
+        sendNotification("codex_app.window_run.stream", {
+          requestId,
+          rpcId,
+          windowId,
+          runId: trackedRunId,
+          event: evt,
+          ...text ? { text } : {}
+        });
+      }
+    }
+    if (run) {
+      const status = normalizeString(run?.status);
+      if (status && !isRunningStatus(status)) {
+        const finalText = lastAssistantText || pickAssistantMessageFromEvents(events);
+        if (finalText) {
+          const chunks = splitTextIntoChunks(finalText, STREAM_TEXT_CHUNK_CHARS);
+          const chunkId = makeId();
+          const chunkCount = chunks.length || 0;
+          if (chunkCount === 0) {
+            sendNotification("codex_app.window_run.stream", {
+              requestId,
+              rpcId,
+              windowId,
+              runId: trackedRunId,
+              finalText,
+              text: finalText,
+              final: true,
+              finalTextComplete: true
+            });
+          } else {
+            for (let i = 0; i < chunks.length; i += 1) {
+              const chunk = chunks[i];
+              sendNotification("codex_app.window_run.stream", {
+                requestId,
+                rpcId,
+                windowId,
+                runId: trackedRunId,
+                finalText: chunk,
+                text: chunk,
+                final: true,
+                finalTextChunk: true,
+                chunkId,
+                chunkIndex: i,
+                chunkCount,
+                finalTextComplete: chunkCount === 1 && i === 0
+              });
+            }
+          }
+        }
+        sendNotification("codex_app.window_run.stream", {
+          requestId,
+          rpcId,
+          windowId,
+          runId: trackedRunId,
+          done: true,
+          status,
+          finishedAt: run?.finishedAt || ""
+        });
+        clearStreamWatcher(token);
+        return;
+      }
+    }
+    if (Date.now() - startMs > STREAM_TIMEOUT_MS) {
+      clearStreamWatcher(token);
+    }
+  };
+  const timer = setInterval(poll, STREAM_POLL_MS);
+  pendingStreams.set(token, timer);
+  poll();
+  return token;
+};
 var WINDOW_RUN_TOOL = "codex_app_window_run";
 var TOOLS = [
   {
@@ -408,7 +670,7 @@ var handleRequest = async (req) => {
       if (!String(prompt || "").trim()) return jsonRpcError(id, -32602, "prompt is required");
       const enhancedPrompt = `${prompt}
 
-执行任务前，先进行分析，将分析后的结果和任务创建根目录下的 codex_plan.md 文件，然后根据这个文件中任务逐一执行。完成后请保留该文件，系统会读取并删除。`;
+\u6267\u884C\u4EFB\u52A1\u524D\uFF0C\u5148\u8FDB\u884C\u5206\u6790\uFF0C\u5C06\u5206\u6790\u540E\u7684\u7ED3\u679C\u548C\u4EFB\u52A1\u521B\u5EFA\u6839\u76EE\u5F55\u4E0B\u7684 codex_plan.md \u6587\u4EF6\uFF0C\u7136\u540E\u6839\u636E\u8FD9\u4E2A\u6587\u4EF6\u4E2D\u4EFB\u52A1\u9010\u4E00\u6267\u884C\u3002\u5B8C\u6210\u540E\u8BF7\u4FDD\u7559\u8BE5\u6587\u4EF6\uFF0C\u7CFB\u7EDF\u4F1A\u8BFB\u53D6\u5E76\u5220\u9664\u3002`;
       const meta = params?._meta;
       const state = loadState(meta);
       const windows = sortWindowsByRecent(Array.isArray(state?.windows) ? state.windows : []);
@@ -450,6 +712,16 @@ var handleRequest = async (req) => {
         meta,
         rpcId: id
       });
+      const streamEnabled = params?._meta?.stream === void 0 ? true : Boolean(params?._meta?.stream);
+      if (streamEnabled) {
+        scheduleStreamNotification({
+          requestId,
+          windowId: targetWindowId,
+          requestedAt: requestCreatedAt,
+          meta,
+          rpcId: id
+        });
+      }
       return jsonRpcResult(id, toolResultText("\u8C03\u7528\u6210\u529F"));
     }
     return jsonRpcError(id, -32601, `Unknown tool: ${name}`);
@@ -457,6 +729,9 @@ var handleRequest = async (req) => {
   if (method === "shutdown") {
     for (const token of pendingCompletions.keys()) {
       clearCompletionWatcher(token);
+    }
+    for (const token of pendingStreams.keys()) {
+      clearStreamWatcher(token);
     }
     return jsonRpcResult(id, { ok: true });
   }
@@ -485,4 +760,3 @@ rl.on("line", async (line) => {
     send(jsonRpcError(req.id, -32e3, e?.message || String(e)));
   }
 });
-

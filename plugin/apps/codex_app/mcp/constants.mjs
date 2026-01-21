@@ -7,3 +7,6 @@ export const DEFAULT_MODEL = 'gpt-5.2-codex';
 export const DEFAULT_APPROVAL = 'never';
 export const COMPLETION_POLL_MS = 1000;
 export const COMPLETION_TIMEOUT_MS = 30 * 60 * 1000;
+export const STREAM_POLL_MS = 400;
+export const STREAM_TIMEOUT_MS = 30 * 60 * 1000;
+export const STREAM_TEXT_CHUNK_CHARS = 4000;

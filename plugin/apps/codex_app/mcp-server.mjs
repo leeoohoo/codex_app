@@ -11,6 +11,9 @@ import {
   DEFAULT_APPROVAL,
   DEFAULT_MODEL,
   MCP_PROTOCOL_VERSION,
+  STREAM_POLL_MS,
+  STREAM_TEXT_CHUNK_CHARS,
+  STREAM_TIMEOUT_MS,
 } from './mcp/constants.mjs';
 import { readJsonFile } from './mcp/files.mjs';
 import {
@@ -59,13 +62,166 @@ const mergeRunOptionsForRequest = (base, override) => {
   return merged;
 };
 
+const normalizeMultilineText = (value) => String(value ?? '').replace(/\r\n?/g, '\n');
+
+const splitTextIntoChunks = (text, size) => {
+  const value = normalizeMultilineText(text);
+  if (!value) return [];
+  const chunkSize = Number.isFinite(size) && size > 0 ? Math.floor(size) : value.length;
+  if (chunkSize <= 0) return [value];
+  const chunks = [];
+  for (let i = 0; i < value.length; i += chunkSize) {
+    chunks.push(value.slice(i, i + chunkSize));
+  }
+  return chunks;
+};
+
+const extractTextFromValue = (value) => {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part === 'object' && typeof part.text === 'string') return part.text;
+        return '';
+      })
+      .filter(Boolean);
+    return parts.join('');
+  }
+  if (value && typeof value === 'object' && typeof value.text === 'string') return value.text;
+  return '';
+};
+
+const pickAssistantTextFromItem = (item) => {
+  if (!item || typeof item !== 'object') return '';
+  const candidates = [item.text, item.content, item.message, item.output_text, item.outputText];
+  for (const candidate of candidates) {
+    const text = extractTextFromValue(candidate);
+    if (text) return normalizeMultilineText(text);
+  }
+  return '';
+};
+
+const formatCodexItem = (item) => {
+  if (!item || typeof item !== 'object') return '';
+  const t = item.type;
+  if (t === 'command_execution') {
+    const status = item.status ? ` status=${item.status}` : '';
+    const code = item.exit_code !== undefined ? ` exit=${item.exit_code}` : '';
+    return `command ${JSON.stringify(item.command || '')}${status}${code}`;
+  }
+  if (t === 'file_change') {
+    const changes = Array.isArray(item.changes) ? item.changes.map((c) => `${c.kind}:${c.path}`).join(', ') : '';
+    return `patch status=${item.status || ''}${changes ? ` changes=[${changes}]` : ''}`;
+  }
+  if (t === 'mcp_tool_call') {
+    return `mcp ${String(item.server || '')}.${String(item.tool || '')} status=${String(item.status || '')}`;
+  }
+  if (t === 'web_search') return `web_search ${JSON.stringify(item.query || '')}`;
+  if (t === 'todo_list') return `todo_list (${Array.isArray(item.items) ? item.items.length : 0} items)`;
+  if (t === 'error') return `error ${JSON.stringify(item.message || '')}`;
+  if (t === 'reasoning') return `reasoning ${JSON.stringify(String(item.text || '').slice(0, 120))}`;
+  if (t === 'agent_message') return `assistant ${JSON.stringify(String(item.text || '').slice(0, 160))}`;
+  return `${String(t || 'item')} ${JSON.stringify(item).slice(0, 200)}`;
+};
+
+const pickAssistantMessageFromEvents = (events) => {
+  if (!Array.isArray(events) || !events.length) return '';
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const evt = events[i];
+    if (evt?.source !== 'codex') continue;
+    const event = evt?.event || null;
+    if (!event) continue;
+    if (event.type !== 'item.completed' && event.type !== 'item.updated') continue;
+    const item = event.item || {};
+    const type = normalizeString(item?.type).toLowerCase();
+    if (!type) continue;
+    if (type === 'agent_message' || type === 'assistant_message' || type === 'message') {
+      const text = pickAssistantTextFromItem(item);
+      if (!text) continue;
+      return text;
+    }
+  }
+  return '';
+};
+
+const extractAssistantTextFromEvent = (evt) => {
+  if (!evt || typeof evt !== 'object') return '';
+  if (evt.source !== 'codex') return '';
+  const event = evt.event || null;
+  if (!event) return '';
+  if (event.type !== 'item.completed' && event.type !== 'item.updated') return '';
+  const item = event.item || {};
+  const type = normalizeString(item?.type).toLowerCase();
+  if (!type) return '';
+  if (type !== 'agent_message' && type !== 'assistant_message' && type !== 'message') return '';
+  const text = pickAssistantTextFromItem(item);
+  if (!text) return '';
+  return text;
+};
+
+const formatStreamEvent = (evt) => {
+  if (evt === undefined || evt === null) return '';
+  if (typeof evt === 'string') return evt;
+  if (typeof evt !== 'object') return String(evt);
+
+  const ts = evt.ts || nowIso();
+  const trunc = evt.truncated ? ` …(truncated, originalLength=${Number(evt.originalLength) || 0})` : '';
+
+  if (evt.source === 'stderr') return `[${ts}] stderr ${String(evt.text || '').trimEnd()}${trunc}`;
+  if (evt.source === 'raw') return `[${ts}] raw ${String(evt.text || '').trimEnd()}${trunc}`;
+  if (evt.line !== undefined) return `[${ts}] ${String(evt.line || '').trimEnd()}`;
+
+  if (evt.source === 'system') {
+    if (evt.kind === 'spawn') return `[${ts}] spawn ${String(evt.command || '')} ${Array.isArray(evt.args) ? evt.args.join(' ') : ''}`;
+    if (evt.kind === 'status') return `[${ts}] status ${String(evt.status || '')}`;
+    if (evt.kind === 'warning') return `[${ts}] warning ${String(evt.message || evt.warning || '')}`;
+    if (evt.kind === 'error') return `[${ts}] error ${String(evt?.error?.message || '')}`;
+    if (evt.kind === 'gap' && evt?.gap && Number.isFinite(evt.gap?.from) && Number.isFinite(evt.gap?.to)) {
+      return `[${ts}] gap dropped_events seq=[${evt.gap.from}, ${evt.gap.to})`;
+    }
+    return `[${ts}] system ${JSON.stringify(evt).slice(0, 320)}`;
+  }
+
+  if (evt.source === 'codex') {
+    const e = evt.event || {};
+    if (e.type === 'thread.started') return `[${ts}] thread.started threadId=${String(e.thread_id || '')}`;
+    if (e.type === 'turn.started') return `[${ts}] turn.started`;
+    if (e.type === 'turn.completed') return `[${ts}] turn.completed usage=${JSON.stringify(e.usage || null)}`;
+    if (e.type === 'turn.failed') return `[${ts}] turn.failed ${String(e?.error?.message || '')}`;
+    if (e.type === 'error') return `[${ts}] error ${String(e.message || '')}`;
+    if (e.type === 'item.started') return `[${ts}] item.started ${formatCodexItem(e.item)}`;
+    if (e.type === 'item.updated') return `[${ts}] item.updated ${formatCodexItem(e.item)}`;
+    if (e.type === 'item.completed') return `[${ts}] item.completed ${formatCodexItem(e.item)}`;
+    return `[${ts}] ${String(e.type || 'event')} ${JSON.stringify(e).slice(0, 320)}`;
+  }
+
+  return `[${ts}] ${JSON.stringify(evt).slice(0, 320)}`;
+};
+
+const getWindowLogEvents = (entry) => {
+  if (!entry || typeof entry !== 'object') return [];
+  const events = Array.isArray(entry.events) ? entry.events : [];
+  if (events.length) return events;
+  const lines = Array.isArray(entry.lines) ? entry.lines : [];
+  return lines.map((line) => ({ source: 'raw', text: String(line ?? '') }));
+};
+
 const pendingCompletions = new Map();
+const pendingStreams = new Map();
 
 const clearCompletionWatcher = (token) => {
   if (!token) return;
   const timer = pendingCompletions.get(token);
   if (timer) clearInterval(timer);
   pendingCompletions.delete(token);
+};
+
+const clearStreamWatcher = (token) => {
+  if (!token) return;
+  const timer = pendingStreams.get(token);
+  if (timer) clearInterval(timer);
+  pendingStreams.delete(token);
 };
 
 const scheduleCompletionNotification = ({ requestId, windowId, requestedAt, meta, rpcId }) => {
@@ -127,6 +283,139 @@ const scheduleCompletionNotification = ({ requestId, windowId, requestedAt, meta
 
   const timer = setInterval(poll, COMPLETION_POLL_MS);
   pendingCompletions.set(token, timer);
+  poll();
+  return token;
+};
+
+const scheduleStreamNotification = ({ requestId, windowId, requestedAt, meta, rpcId }) => {
+  if (!windowId) return '';
+  const token = makeId();
+  const startMs = Date.now();
+  const requestedAtMs = parseIsoTime(requestedAt);
+  let trackedRunId = '';
+  let lastIndex = null;
+  let lastAssistantText = '';
+
+  const poll = () => {
+    const state = loadState(meta);
+    const windows = Array.isArray(state?.windows) ? state.windows : [];
+    const runs = Array.isArray(state?.runs) ? state.runs : [];
+    const win = windows.find((w) => w?.id === windowId) || null;
+
+    if (!trackedRunId) {
+      const activeRunId = normalizeString(win?.activeRunId);
+      if (activeRunId) {
+        const candidate = runs.find((run) => String(run?.id || '') === activeRunId);
+        const startedAtMs = parseIsoTime(candidate?.startedAt);
+        if (candidate && (!requestedAtMs || startedAtMs >= requestedAtMs)) {
+          trackedRunId = String(candidate.id || '');
+        }
+      }
+    }
+
+    if (!trackedRunId) {
+      const candidates = runs.filter((run) => {
+        if (String(run?.windowId || '') !== windowId) return false;
+        const startedAtMs = parseIsoTime(run?.startedAt);
+        return !requestedAtMs || startedAtMs >= requestedAtMs;
+      });
+      candidates.sort((a, b) => parseIsoTime(a?.startedAt) - parseIsoTime(b?.startedAt));
+      if (candidates.length) trackedRunId = String(candidates[0]?.id || '');
+    }
+
+    const run = trackedRunId ? runs.find((item) => String(item?.id || '') === trackedRunId) : null;
+    const logEntry = state?.windowLogs && typeof state.windowLogs === 'object' ? state.windowLogs[windowId] : null;
+    const events = getWindowLogEvents(logEntry);
+
+    if (trackedRunId && lastIndex === null) {
+      const startAtMs = parseIsoTime(run?.startedAt) || requestedAtMs;
+      if (startAtMs) {
+        const foundIndex = events.findIndex((evt) => parseIsoTime(evt?.ts) >= startAtMs);
+        lastIndex = foundIndex >= 0 ? foundIndex : events.length;
+      } else {
+        lastIndex = 0;
+      }
+    }
+
+    if (trackedRunId && Number.isFinite(lastIndex)) {
+      if (events.length < lastIndex) lastIndex = 0;
+      const slice = events.slice(lastIndex);
+      lastIndex = events.length;
+      for (const evt of slice) {
+        const assistantText = extractAssistantTextFromEvent(evt);
+        if (assistantText) lastAssistantText = assistantText;
+        const text = formatStreamEvent(evt);
+        sendNotification('codex_app.window_run.stream', {
+          requestId,
+          rpcId,
+          windowId,
+          runId: trackedRunId,
+          event: evt,
+          ...(text ? { text } : {}),
+        });
+      }
+    }
+
+    if (run) {
+      const status = normalizeString(run?.status);
+      if (status && !isRunningStatus(status)) {
+        const finalText = lastAssistantText || pickAssistantMessageFromEvents(events);
+        if (finalText) {
+          const chunks = splitTextIntoChunks(finalText, STREAM_TEXT_CHUNK_CHARS);
+          const chunkId = makeId();
+          const chunkCount = chunks.length || 0;
+          if (chunkCount === 0) {
+            sendNotification('codex_app.window_run.stream', {
+              requestId,
+              rpcId,
+              windowId,
+              runId: trackedRunId,
+              finalText,
+              text: finalText,
+              final: true,
+              finalTextComplete: true,
+            });
+          } else {
+            for (let i = 0; i < chunks.length; i += 1) {
+              const chunk = chunks[i];
+              sendNotification('codex_app.window_run.stream', {
+                requestId,
+                rpcId,
+                windowId,
+                runId: trackedRunId,
+                finalText: chunk,
+                text: chunk,
+                final: true,
+                finalTextChunk: true,
+                chunkId,
+                chunkIndex: i,
+                chunkCount,
+                finalTextComplete: chunkCount === 1 && i === 0,
+              });
+            }
+          }
+        }
+        sendNotification('codex_app.window_run.stream', {
+          requestId,
+          rpcId,
+          windowId,
+          runId: trackedRunId,
+          done: true,
+          status,
+          finishedAt: run?.finishedAt || '',
+        });
+        clearStreamWatcher(token);
+        return;
+      }
+    }
+
+    if (Date.now() - startMs > STREAM_TIMEOUT_MS) {
+      clearStreamWatcher(token);
+    }
+  };
+
+  const timer = setInterval(poll, STREAM_POLL_MS);
+  pendingStreams.set(token, timer);
   poll();
   return token;
 };
@@ -226,6 +515,16 @@ const handleRequest = async (req) => {
         meta,
         rpcId: id,
       });
+      const streamEnabled = params?._meta?.stream === undefined ? true : Boolean(params?._meta?.stream);
+      if (streamEnabled) {
+        scheduleStreamNotification({
+          requestId,
+          windowId: targetWindowId,
+          requestedAt: requestCreatedAt,
+          meta,
+          rpcId: id,
+        });
+      }
 
       return jsonRpcResult(id, toolResultText('调用成功'));
     }
@@ -236,6 +535,9 @@ const handleRequest = async (req) => {
   if (method === 'shutdown') {
     for (const token of pendingCompletions.keys()) {
       clearCompletionWatcher(token);
+    }
+    for (const token of pendingStreams.keys()) {
+      clearStreamWatcher(token);
     }
     return jsonRpcResult(id, { ok: true });
   }
