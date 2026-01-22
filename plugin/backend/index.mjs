@@ -70,6 +70,7 @@ const RUN_TIMEOUT_MS = MCP_TASK_TIMEOUT_MS;
 const RUN_TIMEOUT_GRACE_MS = 30 * 1000;
 const MCP_TASK_MONITOR_INTERVAL_MS = 60 * 1000;
 const RUN_ABORT_FORCE_MS = 5 * 1000;
+const RUN_ABORT_VERIFY_MS = 1500;
 
 const logTaskEvent = (message, details) => {
   try {
@@ -87,6 +88,116 @@ const logAbortEvent = (message, details) => {
   } catch {
     // ignore
   }
+};
+
+const isProcessAlive = (pid, { useGroup = false } = {}) => {
+  const numericPid = Number(pid);
+  if (!Number.isFinite(numericPid) || numericPid <= 0) return false;
+  const target = useGroup && process.platform !== 'win32' ? -numericPid : numericPid;
+  try {
+    process.kill(target, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const runTaskkill = (pid) =>
+  new Promise((resolve) => {
+    const numericPid = Number(pid);
+    if (!Number.isFinite(numericPid) || numericPid <= 0) return resolve(false);
+    try {
+      const killer = spawn(resolveTaskkillPath(), ['/pid', String(numericPid), '/t', '/f'], {
+        windowsHide: true,
+        env: process.env,
+      });
+      let done = false;
+      const finish = (code) => {
+        if (done) return;
+        done = true;
+        resolve(code === 0);
+      };
+      killer.once('error', () => finish(1));
+      killer.once('exit', finish);
+      killer.once('close', finish);
+    } catch {
+      resolve(false);
+    }
+  });
+
+const killProcessTree = async ({ pid, child, signal = 'SIGTERM', useGroup = false } = {}) => {
+  const numericPid = Number(pid);
+  if (!Number.isFinite(numericPid) || numericPid <= 0) {
+    try {
+      if (child?.kill) child.kill(signal);
+    } catch {
+      // ignore
+    }
+    return { ok: false, pid: 0 };
+  }
+  const alive = isProcessAlive(numericPid, { useGroup });
+  if (!alive && !child) {
+    return { ok: false, pid: numericPid, skipped: true };
+  }
+
+  if (process.platform === 'win32') {
+    const taskkillOk = await runTaskkill(numericPid);
+    if (taskkillOk) return { ok: true, pid: numericPid, method: 'taskkill' };
+    try {
+      if (child?.kill) child.kill(signal);
+    } catch {
+      // ignore
+    }
+    try {
+      process.kill(numericPid, signal);
+    } catch {
+      // ignore
+    }
+    return { ok: false, pid: numericPid, method: 'fallback' };
+  }
+
+  const target = useGroup ? -numericPid : numericPid;
+  try {
+    process.kill(target, signal);
+    return { ok: true, pid: numericPid, method: useGroup ? 'group' : 'pid' };
+  } catch {
+    try {
+      process.kill(numericPid, signal);
+      return { ok: true, pid: numericPid, method: 'pid' };
+    } catch {
+      // ignore
+    }
+  }
+  try {
+    if (child?.kill) child.kill(signal);
+  } catch {
+    // ignore
+  }
+  return { ok: false, pid: numericPid, method: 'fallback' };
+};
+
+const getRunExitPromise = (run) => {
+  if (run?.exitPromise) return run.exitPromise;
+  const child = run?.child;
+  if (!child) {
+    return Promise.resolve({ code: null, signal: null });
+  }
+  run.exitPromise = new Promise((resolve) => {
+    child.once('close', (code, signal) => resolve({ code, signal }));
+    child.once('exit', (code, signal) => resolve({ code, signal }));
+    child.once('error', () => resolve({ code: null, signal: null }));
+  });
+  return run.exitPromise;
+};
+
+const waitForRunExit = async (run, timeoutMs) => {
+  const child = run?.child;
+  if (!child) return true;
+  const exitPromise = getRunExitPromise(run).then(() => true);
+  const timeoutPromise = new Promise((resolve) => {
+    setTimeout(() => resolve(false), timeoutMs);
+  });
+  return await Promise.race([exitPromise, timeoutPromise]);
 };
 
 
@@ -488,77 +599,41 @@ export async function createUiAppsBackend(ctx) {
       // ignore
     }
     const childPid = Number.isFinite(run.childPid) && run.childPid > 0 ? run.childPid : run.child?.pid || 0;
+    const useProcessGroup = process.platform !== 'win32' && Boolean(run.spawnDetached) && childPid > 0;
     const win = windows.get(run.windowId);
     if (win && win.status !== 'aborting') {
       win.status = 'aborting';
       win.updatedAt = nowIso();
       scheduleStateWrite();
     }
-    try {
-      if (run.child?.kill) run.child.kill();
-    } catch {
-      // ignore
-    }
-    if (childPid) {
-      if (process.platform === 'win32') {
-        try {
-          const killer = spawn(resolveTaskkillPath(), ['/pid', String(childPid), '/t', '/f'], {
-            windowsHide: true,
-            env: process.env,
-          });
-          killer.once('error', () => {
-            // ignore
-          });
-        } catch {
-          // ignore
+    pushRunEvent(run, { source: 'system', kind: 'status', status: 'aborting' });
+    const aliveBefore = isProcessAlive(childPid, { useGroup: useProcessGroup });
+    if (aliveBefore || run.child) {
+      await killProcessTree({ pid: childPid, child: run.child, signal: 'SIGTERM', useGroup: useProcessGroup });
+      const exited = await waitForRunExit(run, RUN_ABORT_VERIFY_MS);
+      if (!exited && isProcessAlive(childPid, { useGroup: useProcessGroup })) {
+        logAbortEvent('abort verify failed', { runId: run.id, windowId: run.windowId, pid: childPid });
+        await killProcessTree({ pid: childPid, child: run.child, signal: 'SIGKILL', useGroup: useProcessGroup });
+        const forceExited = await waitForRunExit(run, RUN_ABORT_VERIFY_MS);
+        if (!forceExited && isProcessAlive(childPid, { useGroup: useProcessGroup })) {
+          logAbortEvent('abort immediate force failed', { runId: run.id, windowId: run.windowId, pid: childPid });
         }
-      } else {
-        try {
-          process.kill(childPid, 'SIGTERM');
-        } catch {
-          // ignore
-        }
-        setTimeout(() => {
-          try {
-            process.kill(childPid, 'SIGKILL');
-          } catch {
-            // ignore
-          }
-        }, 1500);
       }
     }
     if (!run.abortForceTimer) {
       run.abortForceTimer = setTimeout(() => {
         if (run.finishedAt) return;
-        logAbortEvent('abort force kill', { runId: run.id, windowId: run.windowId, pid: childPid });
-        if (process.platform === 'win32' && childPid) {
-          try {
-            const killer = spawn(resolveTaskkillPath(), ['/pid', String(childPid), '/t', '/f'], {
-              windowsHide: true,
-              env: process.env,
-            });
-            killer.once('error', () => {
-              // ignore
-            });
-          } catch {
-            // ignore
+        const stillAlive = isProcessAlive(childPid, { useGroup: useProcessGroup });
+        logAbortEvent('abort force kill', { runId: run.id, windowId: run.windowId, pid: childPid, alive: stillAlive });
+        void (async () => {
+          await killProcessTree({ pid: childPid, child: run.child, signal: 'SIGKILL', useGroup: useProcessGroup });
+          const exited = await waitForRunExit(run, RUN_ABORT_VERIFY_MS);
+          if (!exited && isProcessAlive(childPid, { useGroup: useProcessGroup })) {
+            logAbortEvent('abort force verify failed', { runId: run.id, windowId: run.windowId, pid: childPid });
           }
-        }
-        try {
-          if (run.child?.kill) run.child.kill('SIGKILL');
-        } catch {
-          // ignore
-        }
-        if (childPid && process.platform !== 'win32') {
-          try {
-            process.kill(childPid, 'SIGKILL');
-          } catch {
-            // ignore
-          }
-        }
+        })();
       }, RUN_ABORT_FORCE_MS);
     }
-    pushRunEvent(run, { source: 'system', kind: 'status', status: 'aborting' });
     return { ok: true, aborted: true };
   };
 
@@ -596,12 +671,14 @@ export async function createUiAppsBackend(ctx) {
       mcpTaskId,
       childPid: 0,
       nextSeq: 0,
+        exitPromise: null,
         droppedEvents: 0,
         todoList: [],
         todoListId: '',
         todoListUpdatedAt: '',
         planMarkdown: '',
         planMarkdownPath: '',
+        spawnDetached: false,
         child: null,
       };
       runs.set(runId, run);
@@ -651,14 +728,17 @@ export async function createUiAppsBackend(ctx) {
         ? buildWindowsCommandArgs(codexCommand, codexArgs)
         : { command: codexCommand, args: codexArgs };
 
+    const spawnDetached = process.platform !== 'win32';
       const child = spawn(spawnSpec.command, spawnSpec.args, {
         env: process.env,
         signal: abortController.signal,
         windowsHide: true,
+        detached: spawnDetached,
       });
 
       run.child = child;
       run.childPid = child.pid || 0;
+      run.spawnDetached = spawnDetached;
 
     const spawnEvt = { source: 'system', kind: 'spawn', command: codexCommand, args: codexArgs };
     if (spawnSpec.command !== codexCommand) spawnEvt.wrapper = spawnSpec;
@@ -728,6 +808,7 @@ export async function createUiAppsBackend(ctx) {
       child.once('exit', (code, signal) => resolve({ code, signal }));
       child.once('error', () => resolve({ code: null, signal: null }));
     });
+    run.exitPromise = exitPromise;
 
     if (!child.stdout) {
       finish('failed', new Error('codex child process has no stdout'));
@@ -1237,4 +1318,3 @@ export async function createUiAppsBackend(ctx) {
     },
   };
 }
-

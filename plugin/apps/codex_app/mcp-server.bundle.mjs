@@ -276,15 +276,40 @@ var normalizePath = (value) => {
     return raw;
   }
 };
-var getWindowWorkingDirectory = (win) => normalizePath(win?.lastRunOptions?.workingDirectory || win?.defaultRunOptions?.workingDirectory || "");
+var debugLog = (message, details) => {
+  try {
+    const payload = details === void 0 ? "" : ` ${JSON.stringify(details)}`;
+    console.error(`[MCP DEBUG] ${message}${payload}`);
+  } catch {
+  }
+};
+var getWindowWorkingDirectory = (win) => normalizePath(
+  win?.lastRunOptions?.workingDirectory || win?.defaultRunOptions?.workingDirectory || win?.options?.workingDirectory || win?.workingDirectory || ""
+);
 var findWindowByWorkingDirectory = (windows, workingDirectory, { includeRunning = false } = {}) => {
   const needle = normalizePath(workingDirectory);
-  if (!needle) return null;
-  return Array.isArray(windows) ? windows.find((win) => {
+  if (!needle) {
+    debugLog("findWindowByWorkingDirectory: empty needle", { workingDirectory });
+    return null;
+  }
+  const list = sortWindowsByRecent(windows);
+  debugLog("findWindowByWorkingDirectory: start", {
+    workingDirectory,
+    needle,
+    includeRunning,
+    windows: list.length
+  });
+  const match = list.find((win) => {
     if (!includeRunning && isRunningStatus(win?.status)) return false;
     const workdir = getWindowWorkingDirectory(win);
     return workdir && workdir === needle;
-  }) : null;
+  });
+  debugLog("findWindowByWorkingDirectory: result", {
+    id: match?.id || "",
+    status: match?.status || "",
+    workingDirectory: match ? getWindowWorkingDirectory(match) : ""
+  });
+  return match || null;
 };
 
 // plugin/apps/codex_app/mcp-server.mjs
@@ -450,7 +475,22 @@ var handleRequest = async (req) => {
       const windows = sortWindowsByRecent(Array.isArray(state?.windows) ? state.windows : []);
       const defaultsApplied = buildDefaultsApplied({}, meta);
       const workingDirectory = normalizeString(defaultsApplied.workingDirectory);
+      try {
+        console.error("[MCP DEBUG] findWindowByWorkingDirectory: start", {
+          workingDirectory,
+          windows: windows.length
+        });
+      } catch {
+      }
       const windowByWorkdir = findWindowByWorkingDirectory(windows, workingDirectory, { includeRunning: true });
+      try {
+        console.error("[MCP DEBUG] findWindowByWorkingDirectory: result", {
+          workingDirectory,
+          windowId: windowByWorkdir?.id || "",
+          status: windowByWorkdir?.status || ""
+        });
+      } catch {
+      }
       const baseOptions = windowByWorkdir?.defaultRunOptions || windowByWorkdir?.lastRunOptions || {};
       const runOptions = mergeRunOptionsForRequest(defaultsApplied, baseOptions);
       if (workingDirectory) runOptions.workingDirectory = workingDirectory;
