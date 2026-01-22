@@ -1313,7 +1313,9 @@ export function mount({ container, host }) {
     const windowId = state.selectedWindowId;
     if (!windowId) return;
     try {
-      await invoke('codexAbort', { windowId });
+      const win = state.windows.find((w) => w.id === windowId);
+      const runId = win?.activeRunId || '';
+      await invoke('codexAbort', { windowId, ...(runId ? { runId } : {}) });
       await refreshAll();
     } catch (e) {
       state.logs = [`[error] ${e?.message || String(e)}`];

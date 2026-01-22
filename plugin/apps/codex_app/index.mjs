@@ -2565,8 +2565,15 @@ export function mount({ container, host, slots }) {
   btnAbort.addEventListener('click', async () => {
     const windowId = state.selectedWindowId;
     if (!windowId) return;
+    const win = state.windows.find((w) => w.id === windowId);
+    const runId = win?.activeRunId || '';
     try {
-      await invoke('codexAbort', { windowId });
+      await invoke('codexAbort', { windowId, ...(runId ? { runId } : {}) });
+      if (win && isRunningStatus(win.status)) {
+        win.status = 'aborting';
+        if (state.selectedWindowId === windowId) updateSelectedHeader();
+        renderWindowList();
+      }
       appendEvent(windowId, { ts: new Date().toISOString(), source: 'system', kind: 'status', status: 'aborting' });
     } catch (e) {
       appendEvent(windowId, { ts: new Date().toISOString(), source: 'system', kind: 'error', error: { message: e?.message || String(e) } });

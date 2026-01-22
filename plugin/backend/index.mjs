@@ -10,7 +10,12 @@ import {
 import { buildCodexExecArgs, buildWindowsCommandArgs } from './lib/codex.mjs';
 import { pickDirectory } from './lib/dialog.mjs';
 import { readJsonFile, writeJsonFileAtomic } from './lib/files.mjs';
-import { createMcpTaskManager, normalizeMcpTaskStatus } from './lib/mcp-tasks.mjs';
+import {
+  MCP_TASK_QUEUE_TIMEOUT_MS,
+  MCP_TASK_TIMEOUT_MS,
+  createMcpTaskManager,
+  normalizeMcpTaskStatus,
+} from './lib/mcp-tasks.mjs';
 import { findGitRepoRoot, resolveTaskkillPath } from './lib/paths.mjs';
 import { extractMarkdownContentFromEvent, storePlanMarkdown } from './lib/plan-markdown.mjs';
 import { normalizeRequests } from './lib/requests.mjs';
@@ -61,6 +66,29 @@ const findWindowByWorkingDirectory = (windowsMap, workingDirectory, { includeRun
   );
 };
 
+const RUN_TIMEOUT_MS = MCP_TASK_TIMEOUT_MS;
+const RUN_TIMEOUT_GRACE_MS = 30 * 1000;
+const MCP_TASK_MONITOR_INTERVAL_MS = 60 * 1000;
+const RUN_ABORT_FORCE_MS = 5 * 1000;
+
+const logTaskEvent = (message, details) => {
+  try {
+    const payload = details ? ` ${JSON.stringify(details)}` : '';
+    console.error(`[codex_app][mcp-task] ${message}${payload}`);
+  } catch {
+    // ignore
+  }
+};
+
+const logAbortEvent = (message, details) => {
+  try {
+    const payload = details ? ` ${JSON.stringify(details)}` : '';
+    console.error(`[codex_app][abort] ${message}${payload}`);
+  } catch {
+    // ignore
+  }
+};
+
 
 export async function createUiAppsBackend(ctx) {
   const store = getOrCreateBackendStore(ctx);
@@ -93,20 +121,144 @@ export async function createUiAppsBackend(ctx) {
       mcpTasks,
     });
 
-  const { registerMcpTask, markMcpTaskRunning, markMcpTaskFinished, applyMcpTaskResult, writeMcpTaskResultPrompt } =
-    createMcpTaskManager({
-      ctx,
-      mcpTasks,
-      stateDir,
-      stateFile,
-      scheduleStateWrite,
+  const {
+    registerMcpTask,
+    markMcpTaskRunning,
+    markMcpTaskFinished,
+    applyMcpTaskResult,
+    writeMcpTaskResultPrompt,
+    checkTaskTimeouts: checkTaskTimeoutsWithState,
+  } = createMcpTaskManager({
+    ctx,
+    mcpTasks,
+    stateDir,
+    stateFile,
+    scheduleStateWrite,
+  });
+
+  const primeMcpTasksFromRequests = (requests) => {
+    const startRuns = Array.isArray(requests?.startRuns) ? requests.startRuns : [];
+    for (const req of startRuns) {
+      const id = normalizeString(req?.id);
+      if (!id) continue;
+      registerMcpTask(req);
+    }
+  };
+
+  const cleanupStartRunsForTasks = (startRuns) => {
+    const list = Array.isArray(startRuns) ? startRuns : [];
+    return list.filter((entry) => {
+      const id = normalizeString(entry?.id);
+      if (!id) return true;
+      const task = mcpTasks.get(id);
+      if (!task) return true;
+      const status = normalizeMcpTaskStatus(task.status);
+      return status === 'queued';
     });
+  };
+
+  const reconcileRunningTasks = () => {
+    let updated = false;
+    for (const task of mcpTasks.values()) {
+      const status = normalizeMcpTaskStatus(task.status);
+      if (status !== 'running') continue;
+      const runId = normalizeString(task.runId);
+      const run = runId ? runs.get(runId) : null;
+      if (run) {
+        const runStatus = normalizeString(run.status);
+        if (!isRunningStatus(runStatus)) {
+          const updatedTask = markMcpTaskFinished(task.id, runStatus, run.error);
+          if (updatedTask) {
+            applyMcpTaskResult(updatedTask, run);
+            writeMcpTaskResultPrompt(updatedTask, run);
+          }
+          updated = true;
+        }
+        continue;
+      }
+      const message = 'task failed: run missing';
+      task.status = 'failed';
+      task.finishedAt = nowIso();
+      task.error = { message };
+      task.resultStatus = 'failed';
+      task.resultText = task.resultText || message;
+      task.resultAt = task.resultAt || nowIso();
+      updated = true;
+      logTaskEvent('running task missing run', { taskId: task.id, runId });
+    }
+    return updated;
+  };
+
+  const monitorMcpTasksAndRuns = async ({ source = 'sync', requests, applyRequestCleanup = false, primeTasks = false } = {}) => {
+    if (requests && primeTasks) {
+      primeMcpTasksFromRequests(requests);
+    }
+
+    const nowMs = Date.now();
+    const { timedOut } = checkTaskTimeoutsWithState({
+      nowMs,
+      runningTimeoutMs: MCP_TASK_TIMEOUT_MS,
+      queuedTimeoutMs: MCP_TASK_QUEUE_TIMEOUT_MS,
+    });
+
+    if (timedOut.length) {
+      for (const entry of timedOut) {
+        const runId = normalizeString(entry.runId);
+        if (!runId) continue;
+        const run = runs.get(runId);
+        if (!run || !isRunningStatus(run.status)) continue;
+        logTaskEvent('task timeout: aborting run', { source, taskId: entry.id, runId });
+        abortRun(run).catch(() => {
+          // ignore
+        });
+      }
+    }
+
+    let updated = timedOut.length > 0;
+    if (reconcileRunningTasks()) updated = true;
+
+    if (RUN_TIMEOUT_MS) {
+      for (const run of runs.values()) {
+        if (!isRunningStatus(run.status)) continue;
+        const startedAtMs = Date.parse(run.startedAt || '') || 0;
+        if (!startedAtMs) continue;
+        if (nowMs - startedAtMs <= RUN_TIMEOUT_MS) continue;
+        logTaskEvent('run timeout: aborting', { source, runId: run.id, windowId: run.windowId });
+        abortRun(run).catch(() => {
+          // ignore
+        });
+      }
+    }
+
+    if (updated) scheduleStateWrite();
+
+    if (applyRequestCleanup && requestsFile) {
+      const normalized = requests ? normalizeRequests(requests) : normalizeRequests(readJsonFile(requestsFile));
+      const cleanedStartRuns = cleanupStartRunsForTasks(normalized.startRuns);
+      if (cleanedStartRuns.length !== normalized.startRuns.length) {
+        writeJsonFileAtomic(requestsFile, {
+          ...normalized,
+          version: STATE_VERSION,
+          createWindows: Array.isArray(normalized.createWindows) ? normalized.createWindows : [],
+          startRuns: cleanedStartRuns,
+        });
+      }
+      return { cleanedStartRuns };
+    }
+
+    if (requests) {
+      return { cleanedStartRuns: cleanupStartRunsForTasks(requests.startRuns) };
+    }
+
+    return { cleanedStartRuns: [] };
+  };
 
   const syncRequests = async (runtimeCtx) => {
     if (!requestsFile) return;
     const requests = normalizeRequests(readJsonFile(requestsFile));
+    await monitorMcpTasksAndRuns({ source: 'syncRequests', requests });
     const createWindows = requests.createWindows;
-    const startRuns = requests.startRuns;
+    const startRuns = cleanupStartRunsForTasks(requests.startRuns);
     if (!createWindows.length && !startRuns.length) return;
 
     const pendingWindows = [];
@@ -283,6 +435,25 @@ export async function createUiAppsBackend(ctx) {
     return run;
   };
 
+  const parseRunTime = (run) => {
+    const started = Date.parse(run?.startedAt || '') || 0;
+    if (started) return started;
+    return Date.parse(run?.finishedAt || '') || 0;
+  };
+
+  const getRunningRunsForWindow = (windowId) => {
+    const id = normalizeString(windowId);
+    if (!id) return [];
+    const list = [];
+    for (const run of runs.values()) {
+      if (run.windowId !== id) continue;
+      if (!isRunningStatus(run.status)) continue;
+      list.push(run);
+    }
+    list.sort((a, b) => parseRunTime(b) - parseRunTime(a));
+    return list;
+  };
+
   function createWindow({ id: providedId, name, threadId, defaults, source } = {}) {
     const id = normalizeString(providedId) || makeId();
     const now = nowIso();
@@ -308,13 +479,15 @@ export async function createUiAppsBackend(ctx) {
   }
 
   const abortRun = async (run) => {
-    if (!run || (run.status !== 'running' && run.status !== 'aborting')) return { ok: true };
+    if (!run || (run.status !== 'running' && run.status !== 'aborting')) return { ok: true, aborted: false };
     if (run.status !== 'aborting') run.status = 'aborting';
+    logAbortEvent('abort requested', { runId: run.id, windowId: run.windowId, status: run.status });
     try {
       run.abortController?.abort();
     } catch {
       // ignore
     }
+    const childPid = Number.isFinite(run.childPid) && run.childPid > 0 ? run.childPid : run.child?.pid || 0;
     const win = windows.get(run.windowId);
     if (win && win.status !== 'aborting') {
       win.status = 'aborting';
@@ -326,10 +499,10 @@ export async function createUiAppsBackend(ctx) {
     } catch {
       // ignore
     }
-    if (Number.isFinite(run.childPid) && run.childPid > 0) {
+    if (childPid) {
       if (process.platform === 'win32') {
         try {
-          const killer = spawn(resolveTaskkillPath(), ['/pid', String(run.childPid), '/t', '/f'], {
+          const killer = spawn(resolveTaskkillPath(), ['/pid', String(childPid), '/t', '/f'], {
             windowsHide: true,
             env: process.env,
           });
@@ -341,21 +514,52 @@ export async function createUiAppsBackend(ctx) {
         }
       } else {
         try {
-          process.kill(run.childPid, 'SIGTERM');
+          process.kill(childPid, 'SIGTERM');
         } catch {
           // ignore
         }
         setTimeout(() => {
           try {
-            process.kill(run.childPid, 'SIGKILL');
+            process.kill(childPid, 'SIGKILL');
           } catch {
             // ignore
           }
         }, 1500);
       }
     }
+    if (!run.abortForceTimer) {
+      run.abortForceTimer = setTimeout(() => {
+        if (run.finishedAt) return;
+        logAbortEvent('abort force kill', { runId: run.id, windowId: run.windowId, pid: childPid });
+        if (process.platform === 'win32' && childPid) {
+          try {
+            const killer = spawn(resolveTaskkillPath(), ['/pid', String(childPid), '/t', '/f'], {
+              windowsHide: true,
+              env: process.env,
+            });
+            killer.once('error', () => {
+              // ignore
+            });
+          } catch {
+            // ignore
+          }
+        }
+        try {
+          if (run.child?.kill) run.child.kill('SIGKILL');
+        } catch {
+          // ignore
+        }
+        if (childPid && process.platform !== 'win32') {
+          try {
+            process.kill(childPid, 'SIGKILL');
+          } catch {
+            // ignore
+          }
+        }
+      }, RUN_ABORT_FORCE_MS);
+    }
     pushRunEvent(run, { source: 'system', kind: 'status', status: 'aborting' });
-    return { ok: true };
+    return { ok: true, aborted: true };
   };
 
   const startRun = async (params, runtimeCtx) => {
@@ -371,6 +575,7 @@ export async function createUiAppsBackend(ctx) {
     const mcpTaskId = normalizeString(params?.mcpTaskId);
 
     const runId = makeId();
+    const startedAtMs = Date.now();
     const startedAt = nowIso();
     const abortController = new AbortController();
 
@@ -400,6 +605,23 @@ export async function createUiAppsBackend(ctx) {
         child: null,
       };
       runs.set(runId, run);
+
+    if (RUN_TIMEOUT_MS) {
+      run.timeoutTimer = setTimeout(() => {
+        if (run.finishedAt) return;
+        const elapsedMs = Date.now() - startedAtMs;
+        const elapsedMinutes = Math.max(1, Math.round(elapsedMs / 60000));
+        const message = `codex run timed out after ${elapsedMinutes}m`;
+        pushRunEvent(run, { source: 'system', kind: 'error', error: { message } });
+        abortRun(run).catch(() => {
+          // ignore
+        });
+        run.timeoutFinalizeTimer = setTimeout(() => {
+          if (run.finishedAt) return;
+          finish('failed', new Error(message));
+        }, RUN_TIMEOUT_GRACE_MS);
+      }, RUN_TIMEOUT_MS);
+    }
 
     window.status = 'running';
     window.activeRunId = runId;
@@ -458,6 +680,18 @@ export async function createUiAppsBackend(ctx) {
       if (run.finishedAt) return;
       run.status = status;
       run.finishedAt = nowIso();
+      if (run.timeoutTimer) {
+        clearTimeout(run.timeoutTimer);
+        run.timeoutTimer = null;
+      }
+      if (run.timeoutFinalizeTimer) {
+        clearTimeout(run.timeoutFinalizeTimer);
+        run.timeoutFinalizeTimer = null;
+      }
+      if (run.abortForceTimer) {
+        clearTimeout(run.abortForceTimer);
+        run.abortForceTimer = null;
+      }
       run.error = error ? { message: error?.message || String(error) } : null;
       pushRunEvent(run, {
         source: 'system',
@@ -627,6 +861,14 @@ export async function createUiAppsBackend(ctx) {
       // ignore
     }
     try {
+      if (store.mcpMonitorTimer) {
+        clearInterval(store.mcpMonitorTimer);
+        store.mcpMonitorTimer = null;
+      }
+    } catch {
+      // ignore
+    }
+    try {
       if (stateFile) writeJsonFileAtomic(stateFile, buildSharedState());
     } catch {
       // ignore
@@ -638,6 +880,16 @@ export async function createUiAppsBackend(ctx) {
     store.restored = true;
     scheduleStateWrite();
   }
+  if (!store.mcpMonitorTimer) {
+    store.mcpMonitorTimer = setInterval(() => {
+      monitorMcpTasksAndRuns({ source: 'interval', applyRequestCleanup: true, primeTasks: true }).catch(() => {
+        // ignore
+      });
+    }, MCP_TASK_MONITOR_INTERVAL_MS);
+  }
+  monitorMcpTasksAndRuns({ source: 'startup', applyRequestCleanup: true, primeTasks: true }).catch(() => {
+    // ignore
+  });
 
   return {
     methods: {
@@ -773,8 +1025,26 @@ export async function createUiAppsBackend(ctx) {
         if (!id) throw new Error('taskId is required');
         const task = mcpTasks.get(id);
         if (!task) return { ok: true, taskId: id, removed: false };
+        const force = params?.force === true || params?.force === 'true';
         const status = normalizeMcpTaskStatus(task.status);
-        if (status === 'running') throw new Error('cannot delete running mcp task');
+        if (status === 'running') {
+          const runId = normalizeString(task.runId);
+          const run = runId ? runs.get(runId) : null;
+          logTaskEvent('delete running task: aborting run', { taskId: id, runId, force });
+          if (run) {
+            try {
+              await abortRun(run);
+            } catch {
+              // ignore
+            }
+          } else {
+            logTaskEvent('delete running task: run not found', { taskId: id, runId, force });
+          }
+          if (!force) {
+            return { ok: true, taskId: id, removed: false, running: true };
+          }
+        }
+        logTaskEvent('delete task', { taskId: id, status, force });
         mcpTasks.delete(id);
 
         if (requestsFile) {
@@ -898,15 +1168,33 @@ export async function createUiAppsBackend(ctx) {
         const runId = normalizeString(params?.runId);
         const windowId = normalizeString(params?.windowId);
         if (runId) {
-          const run = getRun(runId);
-          return await abortRun(run);
+          const run = runs.get(runId);
+          if (run) {
+            const res = await abortRun(run);
+            return { ok: true, runId: run.id, windowId: run.windowId, aborted: Boolean(res?.aborted) };
+          }
+          logAbortEvent('abort requested but run not found', { runId, windowId });
+          if (!windowId) throw new Error(`run not found: ${runId}`);
         }
         if (windowId) {
           const window = getWindow(windowId);
-          if (!window.activeRunId) return { ok: true };
-          const run = runs.get(window.activeRunId);
-          if (!run) return { ok: true };
-          return await abortRun(run);
+          const activeRun = window.activeRunId ? runs.get(window.activeRunId) : null;
+          const activeIsRunning = activeRun && isRunningStatus(activeRun.status);
+          const candidates = activeIsRunning ? [activeRun] : getRunningRunsForWindow(windowId);
+          if (!candidates.length) {
+            logAbortEvent('abort requested but no running run', { windowId });
+            return { ok: true, windowId, aborted: false };
+          }
+          for (const run of candidates) {
+            await abortRun(run);
+          }
+          return {
+            ok: true,
+            windowId,
+            runId: candidates[0]?.id || '',
+            aborted: true,
+            count: candidates.length,
+          };
         }
         throw new Error('runId or windowId is required');
       },

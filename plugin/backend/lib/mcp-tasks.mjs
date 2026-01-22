@@ -6,6 +6,9 @@ import { appendJsonlFile } from './files.mjs';
 import { buildResultTextWithPlan, readPlanMarkdownFromDisk } from './plan-markdown.mjs';
 import { normalizeString, nowIso } from './utils.mjs';
 
+export const MCP_TASK_TIMEOUT_MS = 30 * 60 * 1000;
+export const MCP_TASK_QUEUE_TIMEOUT_MS = 30 * 60 * 1000;
+
 export const normalizeMcpTaskStatus = (value) => {
   const status = normalizeString(value).toLowerCase();
   if (status === 'running' || status === 'completed' || status === 'failed' || status === 'aborted') return status;
@@ -63,6 +66,45 @@ export const pruneMcpTasks = (mcpTasks) => {
   }
 };
 
+export const checkTaskTimeouts = (
+  mcpTasks,
+  { nowMs = Date.now(), runningTimeoutMs = MCP_TASK_TIMEOUT_MS, queuedTimeoutMs = MCP_TASK_QUEUE_TIMEOUT_MS } = {},
+) => {
+  if (!(mcpTasks instanceof Map)) return { timedOut: [] };
+  const timedOut = [];
+  for (const task of mcpTasks.values()) {
+    const status = normalizeMcpTaskStatus(task.status);
+    if (status !== 'running' && status !== 'queued') continue;
+    const createdAtMs = Date.parse(task.createdAt || '') || 0;
+    const startedAtMs = Date.parse(task.startedAt || '') || 0;
+    const baseMs = status === 'running' ? startedAtMs || createdAtMs : createdAtMs;
+    const timeoutMs = status === 'running' ? runningTimeoutMs : queuedTimeoutMs;
+    if (!baseMs || !timeoutMs) continue;
+    if (nowMs - baseMs <= timeoutMs) continue;
+
+    const elapsedMinutes = Math.max(1, Math.round((nowMs - baseMs) / 60000));
+    const message =
+      status === 'running'
+        ? `task timed out after ${elapsedMinutes}m`
+        : `task timed out while queued after ${elapsedMinutes}m`;
+
+    task.status = 'failed';
+    task.finishedAt = nowIso();
+    task.error = { message };
+    task.resultStatus = 'failed';
+    task.resultText = task.resultText || message;
+    task.resultAt = task.resultAt || nowIso();
+
+    timedOut.push({
+      id: task.id,
+      runId: normalizeString(task.runId),
+      status,
+      reason: status === 'running' ? 'running_timeout' : 'queued_timeout',
+    });
+  }
+  return { timedOut };
+};
+
 export const createMcpTaskManager = ({ ctx, mcpTasks, stateDir, stateFile, scheduleStateWrite }) => {
   const registerMcpTask = (req) => {
     const source = normalizeString(req?.source);
@@ -110,7 +152,8 @@ export const createMcpTaskManager = ({ ctx, mcpTasks, stateDir, stateFile, sched
     task.status = 'running';
     task.runId = normalizeString(runId);
     task.windowId = normalizeString(windowId) || task.windowId;
-    if (!task.startedAt) task.startedAt = nowIso();
+    const startedAtMs = Date.parse(task.startedAt || '') || 0;
+    if (!startedAtMs) task.startedAt = nowIso();
     task.error = null;
     scheduleStateWrite();
     return task;
@@ -197,5 +240,10 @@ export const createMcpTaskManager = ({ ctx, mcpTasks, stateDir, stateFile, sched
     markMcpTaskFinished,
     applyMcpTaskResult,
     writeMcpTaskResultPrompt,
+    checkTaskTimeouts: (options) => {
+      const result = checkTaskTimeouts(mcpTasks, options);
+      if (result.timedOut.length) scheduleStateWrite();
+      return result;
+    },
   };
 };
