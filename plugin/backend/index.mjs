@@ -530,6 +530,79 @@ export async function createUiAppsBackend(ctx) {
     return evt;
   };
 
+  const finalizeRun = (run, status, error, runtimeCtx) => {
+    if (!run || run.finishedAt) return false;
+    run.status = status;
+    run.finishedAt = nowIso();
+    if (run.timeoutTimer) {
+      clearTimeout(run.timeoutTimer);
+      run.timeoutTimer = null;
+    }
+    if (run.timeoutFinalizeTimer) {
+      clearTimeout(run.timeoutFinalizeTimer);
+      run.timeoutFinalizeTimer = null;
+    }
+    if (run.abortForceTimer) {
+      clearTimeout(run.abortForceTimer);
+      run.abortForceTimer = null;
+    }
+    run.error = error ? { message: error?.message || String(error) } : null;
+    pushRunEvent(run, {
+      source: 'system',
+      kind: 'status',
+      status: run.status,
+      finishedAt: run.finishedAt,
+      error: run.error,
+    });
+    const win = windows.get(run.windowId);
+    if (win && win.activeRunId === run.id) {
+      win.status = 'idle';
+      win.activeRunId = '';
+      win.updatedAt = run.finishedAt;
+    }
+    scheduleStateWrite();
+    if (run.mcpTaskId) {
+      const task = markMcpTaskFinished(run.mcpTaskId, status, run.error);
+      if (task) {
+        applyMcpTaskResult(task, run);
+        writeMcpTaskResultPrompt(task, run);
+      }
+    }
+    if (requestsFile) {
+      setTimeout(() => {
+        syncRequests(runtimeCtx).catch(() => {
+          // ignore
+        });
+      }, 0);
+    }
+    return true;
+  };
+
+  const closeRunStreams = (run) => {
+    if (!run) return;
+    try {
+      run.stdoutReader?.close();
+    } catch {
+      // ignore
+    }
+    run.stdoutReader = null;
+    try {
+      run.child?.stdin?.destroy();
+    } catch {
+      // ignore
+    }
+    try {
+      run.child?.stdout?.destroy();
+    } catch {
+      // ignore
+    }
+    try {
+      run.child?.stderr?.destroy();
+    } catch {
+      // ignore
+    }
+  };
+
   const getWindow = (windowId) => {
     const id = normalizeString(windowId);
     if (!id) throw new Error('windowId is required');
@@ -589,7 +662,7 @@ export async function createUiAppsBackend(ctx) {
     return window;
   }
 
-  const abortRun = async (run) => {
+  const abortRun = async (run, runtimeCtx) => {
     if (!run || (run.status !== 'running' && run.status !== 'aborting')) return { ok: true, aborted: false };
     if (run.status !== 'aborting') run.status = 'aborting';
     logAbortEvent('abort requested', { runId: run.id, windowId: run.windowId, status: run.status });
@@ -607,20 +680,29 @@ export async function createUiAppsBackend(ctx) {
       scheduleStateWrite();
     }
     pushRunEvent(run, { source: 'system', kind: 'status', status: 'aborting' });
+    closeRunStreams(run);
+    let exitConfirmed = false;
     const aliveBefore = isProcessAlive(childPid, { useGroup: useProcessGroup });
     if (aliveBefore || run.child) {
       await killProcessTree({ pid: childPid, child: run.child, signal: 'SIGTERM', useGroup: useProcessGroup });
       const exited = await waitForRunExit(run, RUN_ABORT_VERIFY_MS);
-      if (!exited && isProcessAlive(childPid, { useGroup: useProcessGroup })) {
+      if (exited) {
+        exitConfirmed = true;
+      } else if (isProcessAlive(childPid, { useGroup: useProcessGroup })) {
         logAbortEvent('abort verify failed', { runId: run.id, windowId: run.windowId, pid: childPid });
         await killProcessTree({ pid: childPid, child: run.child, signal: 'SIGKILL', useGroup: useProcessGroup });
         const forceExited = await waitForRunExit(run, RUN_ABORT_VERIFY_MS);
-        if (!forceExited && isProcessAlive(childPid, { useGroup: useProcessGroup })) {
+        if (forceExited) {
+          exitConfirmed = true;
+        } else if (isProcessAlive(childPid, { useGroup: useProcessGroup })) {
           logAbortEvent('abort immediate force failed', { runId: run.id, windowId: run.windowId, pid: childPid });
         }
       }
     }
-    if (!run.abortForceTimer) {
+    if (exitConfirmed) {
+      finalizeRun(run, 'aborted', null, runtimeCtx);
+    }
+    if (!run.finishedAt && !run.abortForceTimer) {
       run.abortForceTimer = setTimeout(() => {
         if (run.finishedAt) return;
         const stillAlive = isProcessAlive(childPid, { useGroup: useProcessGroup });
@@ -630,6 +712,10 @@ export async function createUiAppsBackend(ctx) {
           const exited = await waitForRunExit(run, RUN_ABORT_VERIFY_MS);
           if (!exited && isProcessAlive(childPid, { useGroup: useProcessGroup })) {
             logAbortEvent('abort force verify failed', { runId: run.id, windowId: run.windowId, pid: childPid });
+          }
+          if (!run.finishedAt) {
+            logAbortEvent('abort force finalize', { runId: run.id, windowId: run.windowId, pid: childPid });
+            finalizeRun(run, 'aborted', null, runtimeCtx);
           }
         })();
       }, RUN_ABORT_FORCE_MS);
@@ -690,7 +776,7 @@ export async function createUiAppsBackend(ctx) {
         const elapsedMinutes = Math.max(1, Math.round(elapsedMs / 60000));
         const message = `codex run timed out after ${elapsedMinutes}m`;
         pushRunEvent(run, { source: 'system', kind: 'error', error: { message } });
-        abortRun(run).catch(() => {
+        abortRun(run, runtimeCtx).catch(() => {
           // ignore
         });
         run.timeoutFinalizeTimer = setTimeout(() => {
@@ -752,55 +838,13 @@ export async function createUiAppsBackend(ctx) {
 
     if (child.stderr) {
       child.stderr.on('data', (chunk) => {
+        if (run.finishedAt) return;
         pushRunEvent(run, { source: 'stderr', text: String(chunk?.toString?.('utf8') || chunk) });
       });
     }
 
     const finish = (status, error) => {
-      if (run.finishedAt) return;
-      run.status = status;
-      run.finishedAt = nowIso();
-      if (run.timeoutTimer) {
-        clearTimeout(run.timeoutTimer);
-        run.timeoutTimer = null;
-      }
-      if (run.timeoutFinalizeTimer) {
-        clearTimeout(run.timeoutFinalizeTimer);
-        run.timeoutFinalizeTimer = null;
-      }
-      if (run.abortForceTimer) {
-        clearTimeout(run.abortForceTimer);
-        run.abortForceTimer = null;
-      }
-      run.error = error ? { message: error?.message || String(error) } : null;
-      pushRunEvent(run, {
-        source: 'system',
-        kind: 'status',
-        status: run.status,
-        finishedAt: run.finishedAt,
-        error: run.error,
-      });
-      const win = windows.get(run.windowId);
-      if (win && win.activeRunId === run.id) {
-        win.status = 'idle';
-        win.activeRunId = '';
-        win.updatedAt = run.finishedAt;
-      }
-      scheduleStateWrite();
-      if (run.mcpTaskId) {
-        const task = markMcpTaskFinished(run.mcpTaskId, status, run.error);
-        if (task) {
-          applyMcpTaskResult(task, run);
-          writeMcpTaskResultPrompt(task, run);
-        }
-      }
-      if (requestsFile) {
-        setTimeout(() => {
-          syncRequests(runtimeCtx).catch(() => {
-            // ignore
-          });
-        }, 0);
-      }
+      finalizeRun(run, status, error, runtimeCtx);
     };
 
     const exitPromise = new Promise((resolve) => {
@@ -826,6 +870,7 @@ export async function createUiAppsBackend(ctx) {
     }
 
     const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+    run.stdoutReader = rl;
 
     (async () => {
       try {
@@ -834,6 +879,7 @@ export async function createUiAppsBackend(ctx) {
         child.stdin.end();
 
         for await (const line of rl) {
+          if (run.finishedAt || abortController.signal.aborted) break;
           const text = String(line ?? '');
           if (!text) continue;
           try {
@@ -875,6 +921,11 @@ export async function createUiAppsBackend(ctx) {
           }
         }
 
+        if (run.finishedAt) return;
+        if (abortController.signal.aborted) {
+          finish('aborted', null);
+          return;
+        }
         const { code, signal } = await exitPromise;
         if (spawnError) throw spawnError;
         if (abortController.signal.aborted) {
@@ -895,6 +946,7 @@ export async function createUiAppsBackend(ctx) {
         } catch {
           // ignore
         }
+        run.stdoutReader = null;
         try {
           child.removeAllListeners();
         } catch {
@@ -1245,13 +1297,13 @@ export async function createUiAppsBackend(ctx) {
         return await startRun(params, runtimeCtx);
       },
 
-      async codexAbort(params) {
+      async codexAbort(params, runtimeCtx) {
         const runId = normalizeString(params?.runId);
         const windowId = normalizeString(params?.windowId);
         if (runId) {
           const run = runs.get(runId);
           if (run) {
-            const res = await abortRun(run);
+            const res = await abortRun(run, runtimeCtx);
             return { ok: true, runId: run.id, windowId: run.windowId, aborted: Boolean(res?.aborted) };
           }
           logAbortEvent('abort requested but run not found', { runId, windowId });
@@ -1267,7 +1319,7 @@ export async function createUiAppsBackend(ctx) {
             return { ok: true, windowId, aborted: false };
           }
           for (const run of candidates) {
-            await abortRun(run);
+            await abortRun(run, runtimeCtx);
           }
           return {
             ok: true,
